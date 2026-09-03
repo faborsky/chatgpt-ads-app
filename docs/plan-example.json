@@ -1,0 +1,73 @@
+{
+  "_comment": "plan-apply input. Money in ACCOUNT currency; relative paths resolve from this file's folder. Remove keys you don't need. Replace example.com, ces_REPLACE_ME and the copy with yours.",
+  "campaign": {
+    "name": "Acme kurz — podzim 2026",
+    "status": "paused",
+    "bidding_type": "clicks",
+    "daily_budget": 15,
+    "end": "2026-10-31",
+    "location_ids": [
+      "1000055"
+    ],
+    "conversion_event_setting_ids": [
+      "ces_REPLACE_ME"
+    ],
+    "query_string_template": "utm_source=chatgpt&utm_medium=cpc&utm_campaign=acme-podzim",
+    "description": "Pilot: situační sestavy A (styl C – otázky) a G (styl K – klíčovky), stejné reklamy"
+  },
+  "image_file": "card-1200.png",
+  "defaults": {
+    "ad_group": {
+      "strategy": "fixed_bid",
+      "max_bid": 1,
+      "status": "paused"
+    },
+    "ad": {
+      "target_url": "https://www.example.com/kurz",
+      "status": "paused"
+    }
+  },
+  "ad_groups": [
+    {
+      "key": "A",
+      "name": "A · situace (C – otázky)",
+      "hints_file": "hints-A.txt",
+      "query_string_template": "utm_content=A-otazky",
+      "ads": [
+        {
+          "name": "A1 čas",
+          "title": "Kurz práce s AI",
+          "body": "Ušetřete hodiny týdně."
+        },
+        {
+          "name": "A2 praxe",
+          "title": "AI v praxi",
+          "body": "Praktický videokurz. Bez kódu."
+        }
+      ]
+    },
+    {
+      "key": "G",
+      "name": "G · kontrolní (K – klíčovky)",
+      "hints": [
+        "kurz AI",
+        "AI pro marketéry",
+        "naučit se AI",
+        "online kurz AI nástroje"
+      ],
+      "query_string_template": "utm_content=G-control",
+      "ads": [
+        {
+          "name": "G1 čas",
+          "title": "Kurz práce s AI",
+          "body": "Ušetřete hodiny týdně."
+        },
+        {
+          "name": "G2 praxe",
+          "title": "AI v praxi",
+          "body": "Praktický videokurz. Bez kódu."
+        }
+      ]
+    }
+  ]
+}
