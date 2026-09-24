@@ -1,6 +1,6 @@
 # ChatGPT Ads — campaign playbook (how the platform wants campaigns built)
 
-Distilled from OpenAI's official Ads docs and Help Center (Ads in ChatGPT: The Basics, Create Campaigns / Ad Groups / Ads, Measurement Pixel, Conversions API, Product Feeds, Billing, Identity & Access — verified 2026-09-01/02) plus the first published practitioner data. Marked **(practice)** where the source is a real setup, not OpenAI. Use it to turn a project brief into a concrete, compliant setup: structure → context hints → copy → bids → measurement.
+Distilled from OpenAI's official Ads docs and Help Center (Ads in ChatGPT: The Basics, Create Campaigns / Ad Groups / Ads, Measurement Pixel, Conversions API, Product Feeds, Billing, Identity & Access — verified 2026-09-01/02; developer docs re-read 2026-09-24) plus the first published practitioner data. Marked **(practice)** where the source is a real setup, not OpenAI. Use it to turn a project brief into a concrete, compliant setup: structure → context hints → copy → bids → measurement.
 
 ## 0. Prerequisites gate — nothing goes live until these hold
 
@@ -9,7 +9,7 @@ The channel is a *system integration*, not a media line. Check every layer befor
 | # | Layer | What must be true | How to verify |
 |---|---|---|---|
 | 1 | **Account** | Brand review `approved` (name, URL, favicon ≥ 128×128), payment method added, right legal entity/country/currency (cannot be changed later) | `account` (review.status, currency_code, timezone) |
-| 2 | **Spend fuse** | An active spend limit window covers the test period — or, where the endpoint answers 404 (self-serve accounts, 2026-09-02), a daily budget the user accepts at 2× plus a campaign end date | `spend-limits` → `spend-limit-create`, else `--daily-budget` + `--end` |
+| 2 | **Spend fuse** | An account spending limit — **daily** (renews at midnight, account timezone) or a date-range window — covers the test period. Only accounts on postpaid invoice billing with a billing-permitted key have them; a self-serve key gets 403 → then a daily campaign budget the user accepts at 2× plus a campaign end date | `spend-limits` → `daily-spend-limit-set` / `spend-limit-create`, else `--daily-budget` + `--end` |
 | 3 | **Crawlability** | Landing page returns a clean **200 to OAI-AdsBot** (mandatory; OAI-SearchBot recommended) — in `robots.txt` AND through WAF/CDN/anti-bot (Cloudflare, Akamai, captcha, JS challenge, geo blocks, rate limits). The crawler both reviews the page for policy and uses its content for relevance. | `landing-check --url …` (browser vs bot UA, robots, favicon) |
 | 4 | **oppref survives** | OpenAI appends `?oppref=<click ref>` to the landing URL. www/https/locale/consent redirects and SPA routers must keep it, or the Pixel has nothing to store and click attribution is silently lost | `landing-check` (`oppref_survives`); walk the funnel manually with `?oppref=test123` |
 | 5 | **Measurement** | Pixel (`oaiq("measure", …)`) and/or Conversions API deployed *before* the campaign, **even on CPC** (§5). Both → same event `id` for dedup (Pixel ID + event name + id; first delivery wins). CAPI must pass `oppref` itself; the Pixel stores it in the `__oppref` cookie automatically. Consent hook + CSP allow-list in place. Event setting **linked to the campaign** | `conversion-check --events`, `pixels`, `event-settings` |
@@ -29,7 +29,7 @@ Allow: /
 ## 1. Structure and goals
 
 - **Check what Ads Manager generated for you first** (`campaign-detail --with-children`): the "Recommended" campaign it builds from your website defaults to **United States** targeting, `clicks` bidding with `maximize_clicks` (no bid), a daily budget and four generic hints. Fix locations (`--location-ids <country id from geo-search>`) before anything goes active.
-- Hierarchy **campaign → ad group → ad**. Campaign = budget, schedule, locations, platforms (web / iOS / Android), goal. Ad group = context hints + bid (+ product set). Ad = title, body, image, landing URL.
+- Hierarchy **campaign → ad group → ad**. Campaign = budget, schedule, locations, platforms, audiences, goal, conversion events. Ad group = context hints + bid (+ product set). Ad = title, body, image, landing URL.
 - **One ad group = one product category / one intent.** Different products or different user situations → different ad groups. Never mix.
 - Goals: `impressions` (CPM, awareness), `clicks` (CPC, traffic and first tests), `conversions` (oCPC — pays per click, optimizes toward one standard conversion event; only once measurement is live). **The goal cannot be changed after creation**; budget type changes only one way. Wrong choice = new campaign.
 - Start new advertisers on **CPC with a daily budget**, not CPM and not lifetime **(practice + OpenAI onboarding)**.
@@ -79,7 +79,7 @@ Search-term reports from Google Ads / Sklik, Search Console queries, keyword res
 
 **Control ad group naming**: make the style visible in the ad group name (e.g. `G · kontrolní (K – klíčovky)`, `A · situace (C – otázky)`), give it the **same ads** so only the hints differ, and its own `utm_content`.
 
-Account-level **negative keywords** exist in the spec but were not deployed on self-serve accounts (404, 2026-09-02) — until they are, the only way to avoid a context is to not describe it. There is **no report of the prompts/topics that triggered an impression**; optimisation is by hint variants and outcome metrics only.
+There are **no negative keywords**: the account-level endpoint was never deployed on self-serve accounts and left the public spec in 2026-09 — the only way to avoid a context is to not describe it (and to narrow locations/platforms/audiences). There is **no report of the prompts/topics that triggered an impression**; optimisation is by hint variants and outcome metrics only.
 
 ## 3. Ad copy and creative
 
@@ -94,8 +94,10 @@ Account-level **negative keywords** exist in the spec but were not deployed on s
 - Second-price auction weighted by relevance — the highest bid does not simply win.
 - Recommended max CPC **$3–5** (below $3 Ads Manager warns you will get few impressions) **(Help Center)** — treat this as a **US-market calibration**, not a universal floor. The API does **not** enforce a minimum (1 € was accepted). **Cheaper markets (CZ/SK, practice from the first weeks):** bids around 1 EUR per click deliver normally and clear well below the bid (second-price auction), while a bid set far too low makes delivery collapse to a trickle — the failure mode is *no impressions*, not *expensive clicks*. Recipe: start below the US figure when the market is cheap, check impressions after 48 h, raise in steps only if delivery is thin, and judge the channel only once it delivers. Bids are per event in micros: `--max-bid 4` = 4 USD per click; CPM via `--max-cpm`.
 - Minimum daily budget: **25 USD** (US table); **15 € on a EUR account (practice, first Czech setup)**. Daily spend can reach **2× the daily budget** on a given day; the weekly total holds.
-- "Maximize results" automatic bidding exists in Ads Manager (API `strategy: maximize_clicks | maximize_conversions`) — feature availability is per account.
-- Budget is a campaign object replaced as a whole; the spend limit window is the account-level cap.
+- **Maximize Results** (automatic bidding, API `strategy`): `maximize_clicks` in a `clicks` campaign, `maximize_conversions` in a `conversions` campaign; click billing, a **daily** campaign budget, **no** `max_bid_micros`, no audience bid multipliers (`adgroup-update --strategy …` drops them). Back to `fixed_bid` needs an explicit bid. Useful when you do not know the market price; product-feed availability varies per account. Ads Manager's "Recommended" campaign uses `maximize_clicks`.
+- **`bid_too_low`** (`adgroups --bid-check`, `adgroup-detail`, `pulse`): OpenAI's flag that the bid may be too low for reliable delivery. Guidance, not a block; not raised for inactive ad groups or within 24 h of an ad-group edit. On cheap markets it can be on while the ad group delivers fine — check impressions before you raise the bid.
+- Budget is a campaign object replaced as a whole and has **exactly one type** (daily OR lifetime); lifetime → daily is possible, daily → lifetime never (new campaign). A daily budget below an ad group's effective bid can be rejected. Account-level caps: the daily account limit and date-range windows (§0 layer 2).
+- **Platforms** (`--platforms`): `ios_app`, `android_app`, `web` (= all browsers) or a single browser platform `desktop_web` / `ios_web` / `android_web` (since 2026-09-10). Default = all. Narrow only with data: `insights --segment platform` shows delivery per platform (no conversions per platform). An iPhone user in Safari is `ios_web`, not `ios_app`.
 
 ## 5. Measurement details that bite
 
@@ -103,11 +105,14 @@ Account-level **negative keywords** exist in the spec but were not deployed on s
 
 **Setup order (Ads Manager → Tools → Conversions, or API):** 1) data source = pixel (`pixel-create`) → 2) conversion event = event setting (`event-setting-create`) → 3) implement on the site (pixel snippet / CAPI) → 4) **link the event to the campaign** (`campaign-create/update --conversion-event-setting-id`). Step 4 is the one people forget: the event then collects data the campaign never sees. `conversion-check` audits all four; `pulse` warns about active campaigns with no linked event.
 
-**UTM convention** (the API appends its own `oppref`; UTMs are yours): put the **whole template on each ad group** — `utm_source=chatgpt&utm_medium=cpc&utm_campaign=<slug>&utm_content=<ad-group-key>` in the ad group's `query_string_template` (ad group = targeting variant; verified to persist and to measure correctly in GA4). **Leave the campaign `query_string_template` empty.** Precedence campaign vs ad group is not verified; if the ad-group template replaced the campaign one entirely, `utm_source/medium/campaign` would vanish and the channel breakdown with it — so do not split the template across the two levels (the CLI warns when both are set). GA4 files this under *Paid Other* unless you map the source.
+**UTM convention** (the API appends its own `oppref`; UTMs are yours): templates on ad account, campaign, ad group and ad **combine**; for a key set on several levels the most specific wins — **destination URL > ad > ad group > campaign > account** (documented 2026-09). Macros: `{campaign_id}`, `{ad_id}`, `{oppref}`. Live-verified pattern: the **whole template on each ad group** — `utm_source=chatgpt&utm_medium=cpc&utm_campaign=<slug>&utm_content=<ad-group-key>` (ad group = targeting variant; persists and measures correctly in GA4). Per the docs you may also keep `utm_source/medium/campaign` on the campaign and only `utm_content` on the ad groups — not yet verified live. The CLI warns only when the same key is set on two levels. GA4 files this under *Paid Other* unless you map the source.
 
 **Pixel implementation gotchas (not in the Ads Manager help):**
 - The Pixel is injected client-side (GTM etc.) — `curl`/HTML checks won't see it; verify with `conversion-events --pid …` (the debug stream shows `contents[0].id` with the full landing query incl. `oppref`).
-- **Consent**: the Pixel starts with consent = true. With a cookie bar call `oaiq("consent", false)` *before* `oaiq("init", …)` and `oaiq("consent", true)` after the user agrees. Blocked events are not replayed.
+- **Consent**: the Pixel starts with consent = true. With a cookie bar call `oaiq("consent", false)` *before* `oaiq("init", …)` and `oaiq("consent", true)` after the user agrees. Blocked events are not replayed; `consent false` also deletes the `__oppref` (30 days) and `__obref` (365 days) cookies.
+- **No JavaScript** (static thank-you page, email-style HTML): the **image tag** `https://bzr.openai.com/v1/sdk/events?pid=…&event=order_created&event_id=…&data[type]=contents&data[amount]=…&data[currency]=…` — one event per request, no `user` data, no automatic `oppref`; render it only after consent. As a `<noscript>` fallback next to the Pixel it is fine.
+- **Several pixels on one site** (agency, several brands): `init` each Pixel ID; `measure` goes to all, `oaiq("measureSingle", pixelId, event, data, options)` to one.
+- **CAPI extras**: `validate_only: true` checks a payload without saving; partners sending for clients add `integration_source` (stable, 1–64 chars); `action_source` also covers `offline`, `physical_store`, `phone_call`, `email`; hashed `first/last_names_sha256` improve matching (lowercase, strip spaces/punctuation, keep diacritics: `josé`). Batches ≤ 1 000 events, one bad event fails the batch, `timestamp_ms` ≤ 7 days old.
 - **CSP**: allow `bzrcdn.openai.com` (script-src, connect-src) and `bzr.openai.com` (connect-src, img-src). Do not add `'unsafe-inline'` for it — use a nonce or hash.
 
 - Standard events: order_created, lead_created, registration_completed, checkout_started, trial_started, subscription_created, page_viewed, contents_viewed, items_added, appointment_scheduled (+ app_installed/app_opened via CAPI only). Custom events measure but cannot be oCPC goals.
@@ -120,7 +125,7 @@ Account-level **negative keywords** exist in the spec but were not deployed on s
 
 - Ads are shown only to **Free and Go** users, never on Plus/Pro/Business/Enterprise/Edu, under-18 accounts, Temporary Chat or the Atlas browser; never next to sensitive topics (health, mental health, politics…). B2B decision-makers on paid plans are largely unreachable.
 - **EEA/Switzerland: no personalization** (context of the current thread only) and **no custom audiences** for EEA-targeted campaigns. US case studies and benchmarks do not transfer.
-- Custom audiences elsewhere: inclusion needs ≥ 25 000 matched users (100 000 recommended); exclusion works with small lists.
+- Custom audiences elsewhere: inclusion needs ≥ 25 000 matched users (100 000 recommended); exclusion works with small or even empty lists. Membership changes are async operations you can list, resume (interrupted add/remove) and cancel (before they apply).
 - Early public data is thin and unflattering: one A/B (MarTech, ~1 500 users) saw **0.21 % CVR vs 3.71 % on Google Ads** and 17 s vs 41 s engagement; ads appeared on ~26 % of commercial prompts in the US (SE Ranking). Treat the channel as an **experiment with its own budget**, evaluated on cost per acquired customer, not CTR.
 - Practitioners report beta friction: charges without visible impressions, campaigns stuck in "Not serving", weak topical matching. Features roll out per account week by week (weekly product e-mail) — two advertisers may not see the same options.
 
@@ -139,17 +144,17 @@ The fastest way from brief to account is **one plan file** → `plan-apply --fil
 ```
 Project: <name>            Market: <countries>      Currency (account): <…>
 Goal: clicks (CPC) | conversions (oCPC on <event>) | impressions (CPM)
-Budget: daily <…> (min 15 €/25 $)   Spend cap window: <from> → <to (excl.)> <amount>
+Budget: daily <…> (min 15 €/25 $)   Account cap: daily limit <…> | window <from> → <to (excl.)> <amount> | none (403 → budget + end date)
+Platforms: all | <ios_app, android_app, web | desktop_web, ios_web, android_web>
 Landing: <public URL> (landing-check ✅, oppref ✅, OAI-AdsBot ✅)
 Measurement: pixel <id> / CAPI key ✅ / event setting <ces_…> (dedup by event id) → LINKED to every campaign ✅
 Site: consent hook before init ✅   CSP allows bzrcdn.openai.com + bzr.openai.com ✅
 
-Campaign query_string_template: (none — the full template lives on the ad groups)
+Campaign query_string_template: (none — the full template lives on the ad groups; or utm_source/medium/campaign here + utm_content per ad group, unverified live)
 Ad group A — <intent 1>    bid: <…>/click   query_string_template: utm_source=chatgpt&utm_medium=cpc&utm_campaign=<slug>&utm_content=A-<slug>
   hints (situations, 20–60): …
   ads (3–5 angles): title ≤16 | body ≤32 | image (no text, no logo) | URL
 Ad group B — <intent 2> …  …&utm_content=B-<slug>
 Ad group G — control (keyword-style hints, SAME ads) …  …&utm_content=G-control
-Negative keywords (account): …
 Evaluation: CAC vs other channels after ≥ 2 weeks; weekly review of ad-review + pulse.
 ```

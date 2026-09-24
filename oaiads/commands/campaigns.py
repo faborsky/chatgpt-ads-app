@@ -11,8 +11,24 @@ from oaiads.commands.common import (
 
 BIDDING_TYPES = ["impressions", "clicks", "conversions"]
 OBJECTIVES = ["reach", "clicks", "conversions"]
-PLATFORMS = ["web", "ios_app", "android_app"]
+# 2026-09-10: web split into desktop_web / ios_web / android_web; `web` still means ALL web platforms.
+WEB_PLATFORMS = ["desktop_web", "ios_web", "android_web"]
+PLATFORMS = ["web", *WEB_PLATFORMS, "ios_app", "android_app"]
+# business_agent is still in the campaign `mode` enum, but the /business_agents endpoints left the public spec (2026-09).
 MODES = ["product_feed", "business_agent"]
+
+
+def platforms_from_csv(value: str) -> list[str]:
+    """--platforms → validated list. An empty list is a 400 on the API (use --clear-platforms instead)."""
+    plats = parse_csv(value)
+    if not plats:
+        _die("ERROR: --platforms needs at least one value; to remove the platform restriction use --clear-platforms.")
+    bad = [p for p in plats if p not in PLATFORMS]
+    if bad:
+        _die(f"ERROR: unknown platform(s) {bad}; use {PLATFORMS}.")
+    if "web" in plats and any(p in WEB_PLATFORMS for p in plats):
+        _err(f"⚠ 'web' already includes {WEB_PLATFORMS} — listing both is redundant. For specific browsers drop 'web'.")
+    return plats
 
 
 def _list_params(args) -> list:
@@ -124,11 +140,10 @@ def _targeting_from_args(args, current: dict | None = None) -> dict | None:
         t["excluded_custom_audiences"] = {"ids": parse_csv(args.exclude_audience_ids)}
         touched = True
     if getattr(args, "platforms", None) is not None:
-        plats = parse_csv(args.platforms)
-        bad = [p for p in plats if p not in PLATFORMS]
-        if bad:
-            _die(f"ERROR: unknown platform(s) {bad}; use {PLATFORMS}.")
-        t["platforms"] = {"included": plats}
+        t["platforms"] = {"included": platforms_from_csv(args.platforms)}
+        touched = True
+    if getattr(args, "clear_platforms", False):
+        t["platforms"] = None  # clears ONLY the platform restriction; {} or [] would be a 400
         touched = True
     if current is not None:
         # Strip server-expanded location metadata so we only send ids back.
@@ -147,6 +162,8 @@ def _budget_from_args(args) -> dict | None:
     budget: dict = {}
     lifetime = money_flag(getattr(args, "lifetime_budget", None), "--lifetime-budget", lint.BUDGET_MIN_MICROS)
     daily = money_flag(getattr(args, "daily_budget", None), "--daily-budget", lint.BUDGET_MIN_MICROS)
+    if lifetime is not None and daily is not None:
+        _die("ERROR: give --daily-budget OR --lifetime-budget — a campaign has exactly one budget type.")
     if lifetime is not None:
         budget["lifetime_spend_limit_micros"] = lifetime
     if daily is not None:
@@ -184,6 +201,9 @@ def cmd_campaign_create(args) -> None:
     if args.business_agent_id:
         body["business_agent_id"] = args.business_agent_id
         body.setdefault("mode", "business_agent")
+    if body.get("mode") == "business_agent":
+        findings.append(("warn", "mode business_agent: the Business Agent endpoints were removed from the public spec (2026-09) — "
+                                 "expect 403/404 unless OpenAI enabled it for the account."))
     if args.conversion_event_setting_id:
         ids = parse_csv(args.conversion_event_setting_id)
         body["conversion_event_setting_ids"] = ids
@@ -196,7 +216,13 @@ def cmd_campaign_create(args) -> None:
                                  "--conversion-event-setting-id (see event-settings) so conversions/CPA show up and oCPC data accrues."))
     targeting = _targeting_from_args(args)
     if targeting is not None:
+        if targeting.get("platforms") is None:
+            targeting.pop("platforms", None)  # --clear-platforms on create = no restriction = omit
         body["targeting"] = targeting
+        if body.get("mode") == "product_feed" and ((targeting.get("locations") or {}).get("include")
+                                                   or (targeting.get("excluded_locations") or {}).get("include")):
+            findings.append(("warn", "product-feed campaigns support geographic targeting/exclusions at COUNTRY level only — "
+                                     "use --countries (or country location ids), not region/market ids."))
     if args.query_string_template:
         body["landing_page_configuration"] = {"query_string_template": args.query_string_template}
     if args.status == "active":
@@ -233,14 +259,25 @@ def cmd_campaign_update(args) -> None:
         body["end_time"] = end
     if args.clear_end_time:
         body["end_time"] = None
+    current_campaign: dict | None = None
+    if budget and budget.get("lifetime_spend_limit_micros"):
+        current_campaign = api._api_call("GET", f"/campaigns/{args.campaign_id}")
+        if (current_campaign.get("budget") or {}).get("daily_spend_limit_micros"):
+            findings.append(("error", "a daily budget cannot be switched back to lifetime (only lifetime → daily). "
+                                      "Create a new campaign for a lifetime budget."))
     if args.clear_targeting:
         body["targeting"] = None
     else:
-        needs_current = any(getattr(args, k, None) is not None for k in
-                            ("countries", "location_ids", "exclude_location_ids", "audience_ids",
-                             "exclude_audience_ids", "platforms"))
-        current = api._api_call("GET", f"/campaigns/{args.campaign_id}").get("targeting") if needs_current else None
-        targeting = _targeting_from_args(args, current)
+        geo_or_audience = any(getattr(args, k, None) is not None for k in
+                              ("countries", "location_ids", "exclude_location_ids", "audience_ids", "exclude_audience_ids"))
+        if geo_or_audience:
+            if current_campaign is None:
+                current_campaign = api._api_call("GET", f"/campaigns/{args.campaign_id}")
+            targeting = _targeting_from_args(args, current_campaign.get("targeting") or {})
+        else:
+            # Platform-only update: send just `platforms` — the API keeps locations/audiences untouched (docs 2026-09),
+            # and re-sending audiences would re-validate them (409 custom_audience_mutation_conflict risk).
+            targeting = _targeting_from_args(args)
         if targeting is not None:
             body["targeting"] = targeting
     if args.conversion_event_setting_id is not None:
@@ -259,7 +296,8 @@ def cmd_campaign_update(args) -> None:
         _die("Lint errors — fix them first.")
     run_write("POST", f"/campaigns/{args.campaign_id}", body, args,
               f"Campaign {args.campaign_id} updated.", idempotent=True,
-              note="budget is replaced as a whole object; targeting merges your flags into the current spec.",
+              note="budget is replaced as a whole object; location/audience flags merge into the current targeting, "
+                   "a platform-only change sends just `platforms` (the API keeps the rest).",
               verify_path=f"/campaigns/{args.campaign_id}")
 
 

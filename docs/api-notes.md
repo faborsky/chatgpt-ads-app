@@ -1,6 +1,6 @@
 # OpenAI Advertiser API — poznámky k reálnému chování
 
-Jak se API chová podle oficiální dokumentace (developers.openai.com/ads, OpenAPI spec 2.3.0, research 2026-09-02). Položky označené **(živě)** jsou ověřené na reálném účtu; ostatní vychází ze spec/docs. Sekce „Neověřeno živě" na konci = co si ověřit v první live session.
+Jak se API chová podle oficiální dokumentace (developers.openai.com/ads, OpenAPI spec 2.3.0, research 2026-09-02, znovu srovnáno 2026-09-24). Položky označené **(živě)** jsou ověřené na reálném účtu; ostatní vychází ze spec/docs. Sekce „Neověřeno živě" na konci = co si ověřit v první live session.
 
 ## Základ
 
@@ -8,7 +8,32 @@ Jak se API chová podle oficiální dokumentace (developers.openai.com/ads, Open
 - **Klíč vydává Ads Manager (ads.openai.com → Settings → API keys) a je scoped na JEDEN ad account.** Víc účtů = víc klíčů (`OPENAI_ADS_API_KEY_<NAME>` + `--account`). `POST /api_keys` umí vyrobit další klíč pro tentýž účet (rotace).
 - Spec zná i OAuth (`auth.openai.com`, scopes `ads.admin.all.read/write`, `offline_access`) s hlavičkou `OpenAI-Ad-Account` pro výběr účtu — to je partnerská cesta (agentury). S API klíčem hlavičku **neposílat** (docs u Bulk API to říkají explicitně).
 - Update je vždy **POST na `/resource/{id}`** (žádný PUT/PATCH) — jediný PATCH v celém API je `PATCH /feeds/{id}/products` (delta feed).
-- Verze API nemá datum ani header — spec `info.version` 2.3.0; changelog v docs (api-overview.md) je jediný signál změn. Kontrolovat občas: https://developers.openai.com/ads/api-overview#changelog.
+- Verze API nemá datum ani header — spec `info.version` 2.3.0; changelog v docs (api-overview.md) je jediný signál změn. Kontrolovat občas: https://developers.openai.com/ads/api-overview#changelog. **Pozor: OpenAI mění obsah spec bez změny čísla verze** (2026-09-24: pořád „2.3.0“, ale 78 operací místo 88). Změnu proto hledej diffem operací a schémat (spec vs. cesty v `oaiads/`) a přečtením `https://developers.openai.com/ads/llms-full.txt` (celé docs v jednom souboru), ne podle čísla verze.
+
+## Změny API 2026-09 (srovnání 2026-09-24)
+
+Oproti researchi 2026-09-02. Zdroj: changelog, diff spec, celé docs, živé čtení na dvou self-serve účtech (EUR).
+
+**Nové v API**
+- **2026-09-09 — denní limit útraty účtu**: `POST /ad_account/daily_spend_limit` (`amount_micros`, `expected_revision` povinné; `start_date` jen u nového limitu, nejdřív zítra; `end_date` exkluzivní, `null` = bez konce) a `POST /ad_account/daily_spend_limit/delete` (`expected_revision`). `GET /ad_account/spend_limit_windows` teď vrací objekt `{data: [date-range okna], daily_limit, revision, earliest_daily_start_date, earliest_dated_start_date, can_create_daily_limit, evaluated_at}`; `daily_limit` nese `spent_micros`, `remaining_micros`, `spend_as_of`, `next_reset`. Stavy oken `upcoming|active|completed`, max 60 budoucích oken, okna se nesmí překrývat (ani s denním limitem). Chyby: 409 = zastaralá revize, 422 `budget_window_amount_below_spend`, **503 = změna možná prošla, nejdřív znovu načíst**. Limity platí jen pro účty **na fakturu (postpaid invoice)** a všechna volání (i čtení) chtějí **právo spravovat billing**. **(živě)** self-serve API klíč: `403 "Only ad account admins can perform this action."` (dřív 404 `Invalid URL`).
+- **2026-09-10 — granulární web platformy**: `targeting.platforms.included` bere `desktop_web`, `ios_web`, `android_web` vedle `web` (= všechny weby, zůstává), `ios_app`, `android_app`. Update: vynechané `platforms` = beze změny, `platforms: null` = zruší jen omezení platforem, `{}` nebo `included: []` = 400. **Update jen s platformami zachová lokace i audiences.** Insights: `segments[]=platform` + `fields[]=platform`; historické řádky `web` se zpětně nerozpadají; filtr `platform IN ["web"]` zahrne všechny weby; per platformu nejsou konverze. **(živě)** segment funguje, metriky jako ploché klíče `clicks`/`spend`/`impressions`.
+- **Audience operace** (ve spec nově): `GET /custom_audiences/{id}/operations` (`limit` 1–100, stránkování přes `next_cursor` → `cursor`, pokračovat dokud `has_more`, i přes prázdnou stránku), `POST …/operations/{op}/resume` (jen add/remove; bez těla a bez klíče; na `409 custom_audience_operation_recovery_required`), `POST …/operations/{op}/cancel` (jen add/remove, jen než se začne aplikovat; úspěch = `status: failed`, stav `canceled` neexistuje; `409 custom_audience_mutation_conflict` = už běží nebo hotovo; `503` = zopakovat cancel stejného id).
+- **`include[]=bid_too_low`** na ad group (docs, ve spec enum chybí): `bid_too_low: true` = bid je nejspíš moc nízký na spolehlivé doručování. Je to jen doporučení, doručování neblokuje. Nehlásí se u neaktivních sestav a 24 h po úpravě sestavy (úprava reklamy okno neresetuje), takže jeho absence nedokazuje konkurenceschopný bid. **(živě)** funguje na detailu i na `GET /ad_groups`.
+- `GET /ad_account` vrací nově **`origin_country_code`** (živě). `GET /conversions/events` bere `limit`. Reporting: `product.carousel_product_card_impressions/clicks`, `order_created_attributed_sales_currency`.
+- Conversions API (`bzr.openai.com`, mimo Advertiser API, CLI ho neposílá): `integration_source` (partnerský identifikátor 1–64 znaků), `validate_only`, `action_source` i `offline|physical_store|phone_call|email|other`, `opt_out`, `user` s `first/last_names_sha256`, `regions`, `android_advertising_id` (GAID; IDFA ne), max 1 000 eventů v dávce (chyba jednoho = celá dávka), `timestamp_ms` max 7 dní zpět. Nový **image tag** (`<img src="https://bzr.openai.com/v1/sdk/events?pid=…&event=…&data[type]=…">`, bez JS, bez `user`), **více pixelů** na stránce (`oaiq("measureSingle", pixelId, …)`), cookies `__oppref` 30 dní / `__obref` 365 dní, `oaiq("consent", false)` obě smaže.
+
+**Nově zdokumentované chování (dřív neověřené)**
+- **UTM šablony se sčítají**: `landing_page_configuration.query_string_template` na účtu, kampani, sestavě i reklamě se kombinuje; u duplicitního klíče platí priorita **cílová URL > reklama > sestava > kampaň > účet**. Makra `{campaign_id}`, `{ad_id}`, `{oppref}` (příklad `click_id={oppref}`). Tím padá dřívější obava „sestavová šablona nahradí kampaňovou celou“.
+- **Maximize Results**: `maximize_clicks` jen v kampani `clicks`, `maximize_conversions` jen v `conversions`; obě `billing_event_type: click`, **denní** budget kampaně, **bez** `max_bid_micros`, bez audience multiplikátorů; `Idempotency-Key` při create povinný. Přepnutí zpět na `fixed_bid` = explicitní bid; multiplikátory se musí poslat znovu. Dostupnost Maximize u produktových kampaní závisí na účtu.
+- **Budget**: právě jeden z `daily_spend_limit_micros` / `lifetime_spend_limit_micros`. Celkový → denní jde, denní → celkový ne (nová kampaň). Snížení denního budgetu pod efektivní bid sestavy API může odmítnout; minima denního budgetu závisí na měně (chyba řekne částku).
+- Produktové kampaně: geo cílení i vyloučení jen na úrovni **zemí**; filtry product setu i přes `ads_metadata.<klíč>` (vlastní štítky, např. `custom_label_0`); template makro `{{brand}}`; feed nejde archivovat, dokud je navázaný na nearchivovanou kampaň/sestavu. oCPC u produktových kampaní v open beta.
+- Retence reportingu: hodinová ~30 dní, produktová ~30 dní, ostatní 365 dní; `POST /conversions/insights` daily max 365 dní. Spend/CPC/CPM se finalizují později než imprese/kliky; konverze denním zpracováním (počkat aspoň den).
+- Favicon účtu: `POST /upload` s `purpose: account_favicon` umí i URL webu (API si ikonu najde); min. 128×128 (Files) vs. 256×256 (Account Management) — docs si odporují, bezpečně 256.
+- Bulk API: `ad_group.create/update` znají `exclusion_hints` (jen v bulku, REST je nemá); `max_cpm_bid_micros` jen s přístupem pro účet; `ad.update` s kreativou chce `title`, `body`, `target_url` i `file_id`.
+
+**Zmizelo z veřejné spec** (endpointy, CLI příkazy deprecated, odchod ve 2.0): `/ad_account/negative_keywords` (4 operace), `/lead_forms*` (7), `/business_agents*` + `/business_agent_tools` (7). Na self-serve nikdy nefungovaly (404 / 403). `mode: business_agent` a `business_agent_id` na kampani ve spec zůstaly. Lead sync (`/lead_sync_subscriptions*`) zůstal.
+
+**Nové serving kódy (živě)**: `campaign_ended` (reklamy kampaně po `end_time`, očekávaný stav), `review_not_approved` (doprovází `review_status: rejected`).
 
 ## Rate limity
 
@@ -34,11 +59,11 @@ Jak se API chová podle oficiální dokumentace (developers.openai.com/ads, Open
 
 ## Peníze a bidování
 
-- Vše v **micros** (1 000 000 = 1 jednotka měny účtu, `currency_code` z `GET /ad_account`). Budget min. `1000000`. Spend limit windows `amount_micros` min 0.
+- Vše v **micros** (1 000 000 = 1 jednotka měny účtu, `currency_code` z `GET /ad_account`). Budget min. `1000000`. Limity útraty účtu `amount_micros` min 0, max 10^15 (1 mld. jednotek), násobky nejmenší jednotky měny (USD: 10 000 micros).
 - `bidding_type` kampaně: `impressions` (CPM, default) / `clicks` (CPC) / `conversions` (oCPC, platí se za klik, optimalizuje na 1 standardní event). **Po vytvoření neměnné** (ani `mode`, ani event setting u oCPC).
 - Ad group `bidding_config.billing_event_type` musí odpovídat: `impression` pro impressions kampaň, `click` pro clicks/conversions. `max_bid_micros` je **per event**: $60 CPM = 60 000 micros per impression; u oCPC je to **CPA bid** (100 000 000 = $100 CPA). `strategy`: `fixed_bid` | `maximize_clicks` | `maximize_conversions` (ve spec, v docs nezmíněno — ověřit).
 - Spec zná i `objective` (`reach|clicks|conversions`) a `billing_event_type` na kampani — docs je nepoužívají; CLI je posílá jen když je zadáš.
-- `budget` na update = **celý objekt** (lifetime i daily); `BudgetParams` má obě pole, docs vyžadují lifetime.
+- `budget` na update = **celý objekt**; právě jeden typ (daily NEBO lifetime), lifetime → daily jde, zpět ne (docs 2026-09).
 
 ## Čas a timezone
 
@@ -58,10 +83,10 @@ Jak se API chová podle oficiální dokumentace (developers.openai.com/ads, Open
 ## Targeting
 
 - `targeting.locations.countries` (ISO) a/nebo `targeting.locations.include[{id}]` (max 2 500 ids z `GET /geo_lookup/search` — typy country/region/DMA; CSV katalog developers.openai.com/ads/openai-geotargets.csv). Spec zná i `excluded_locations`. Bez targetingu = všechny dostupné lokality.
-- `platforms.included` `web|ios_app|android_app`.
+- `platforms.included` `web|desktop_web|ios_web|android_web|ios_app|android_app` (granulární weby od 2026-09-10; `web` = všechny). Update jen platforem zachová zbytek targetingu; `null` zruší jen platformy.
 - `custom_audiences.ids` / `excluded_custom_audiences.ids` — **nefunguje pro EEA/Švýcarsko** (personalizované reklamy tam zatím nejsou). Pro CZ inzerenta tedy audiences zatím jen mimo EU.
 - Update targetingu = celý objekt; `null` ho smaže. CLI si načte současný, ořeže expandovaná location metadata na `{id}` a mergne flagy.
-- **Negativní klíčová slova jsou na úrovni účtu** (`POST /ad_account/negative_keywords`, max 100 × 100 znaků, replace semantics) — cílit klíčovkami nejde, vyloučit ano. CLI nabízí add/remove jako read-modify-write.
+- ~~Negativní klíčová slova na úrovni účtu~~ (`POST /ad_account/negative_keywords`) — **ze spec stažené 2026-09**, na self-serve nikdy nenasazené (404). Kontext řídí jen hints a cílení.
 
 ## Custom audiences
 
@@ -146,11 +171,12 @@ Jak se API chová podle oficiální dokumentace (developers.openai.com/ads, Open
 
 ## Neověřeno živě (zbývá)
 
-- Wire klíče insights metrik (`spend` vs `campaign_spend`) — až bude doručení.
 - `Idempotency-Key` chování při skutečném retry, `Retry-After` u 429 (žádný 429 zatím nenastal).
 - `until=today` u insights; `image_crop` jiný než celý; `price` na chat_card; WebP upload.
 - Zda `strategy: maximize_clicks` jde poslat přes API bez `max_bid_micros` (UI to tak vytvořilo; API přijalo `fixed_bid` + bid).
-- Precedence `query_string_template` kampaň vs. ad group vs. ad. **Do ověření: celá šablona (utm_source/medium/campaign + utm_content) na sestavu, kampaňovou nepoužívat** — sestavová funguje samostatně (měřeno v GA4 v pilotu), skládání obou je hazard (sestavová může kampaňovou celou nahradit). CLI na kombinaci varuje.
+- ~~Precedence `query_string_template`~~ — **zdokumentováno 2026-09**: šablony se sčítají, duplicitní klíč z nejkonkrétnější úrovně (viz Změny API 2026-09). Živě ověřená zůstává jen celá šablona na sestavě; rozdělení kampaň + sestava je podle docs, živě zatím ne.
+- Zápis denního limitu útraty (`daily-spend-limit-set`) — self-serve klíč dostane 403 už na čtení; ověřit na účtu na fakturu.
+- `audience-operations` / `-resume` / `-cancel` — účty zatím nemají žádné audiences.
 - Bulk API zápis (`validate_only`), CAPI klíč (`POST /conversions/api_keys`), `POST /conversions/pixels` na self-serve.
 
 ## Poznámky z ostrého provozu
@@ -189,3 +215,11 @@ Zkráceně (plné znění interního reportu je mimo repo):
 - ⚠️ `campaign-detail --with-children` neukazuje reklamy pod ad groups (jen ad groups).
 - ⚠️ `landing-check` tiskne „Recommended robots.txt" i u čistého výsledku (šum).
 - Nápad: `campaign-plan/apply` z jednoho YAML (kampaň → ad groups s hints_file + utm_content → ads) místo 25 samostatných volání; hint po update „ověř detailem"; `conversion-events --json`.
+
+### 2026-09-24 — srovnání s API po 2026-09-02 (čtení na dvou účtech) → opraveno v 1.5.0
+
+- 🟠 `pulse` / `ad-review` hlásily reklamy skončené kampaně jako problém: nový serving kód `campaign_ended` nebyl mezi očekávanými stavy (na živém účtu tvořil většinu hlášených „problémů“; skutečné byly jen zamítnuté reklamy s `review_not_approved`). Fix: `campaign_ended` ∈ `PAUSED_CODES`.
+- 🟡 `insights --segment …` (country/device/platform/product) s `aggregation_level=campaign` vracel řádky kampaň × segment, ale tabulka ukazovala jen segment, takže řádky vypadaly zdvojeně. Fix: sloupec s entitou.
+- 🟡 `spend-limits` / `pulse` / `account` znaly jen 404; self-serve klíč dnes dostává 403 „Only ad account admins“ → `spend-limits` padal s „contact partner rep“. Fix: 403 i 404 = „pojistka přes API nedostupná“.
+- ✅ **Živě ověřeno:** `include[]=bid_too_low` (detail i list), `segments[]=platform` s `fields[]=platform` (granulární weby v datech od 2026-09-10), ploché wire klíče metrik (`clicks`, `spend`, `impressions`, `cpc`, `cpm`, `ctr` jako podíl), `origin_country_code` na účtu.
+

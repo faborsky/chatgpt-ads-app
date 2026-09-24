@@ -1,5 +1,5 @@
 {
-  "_comment": "plan-apply input. Money in ACCOUNT currency; relative paths resolve from this file's folder. Remove keys you don't need. Replace example.com, ces_REPLACE_ME and the copy with yours. UTM: the FULL template goes on each ad group (campaign vs ad-group precedence is unverified — never split it across both levels).",
+  "_comment": "plan-apply input. Money in ACCOUNT currency; relative paths resolve from this file's folder. Remove keys you don't need. Replace example.com, ces_REPLACE_ME and the copy with yours. UTM: templates on campaign / ad group / ad combine and a duplicate key comes from the most specific level; the live-verified pattern is the FULL template on each ad group (as below). Platforms (optional): \"platforms\": [\"ios_app\", \"android_app\", \"web\" | \"desktop_web\", \"ios_web\", \"android_web\"].",
   "campaign": {
     "name": "Acme kurz — podzim 2026",
     "status": "paused",

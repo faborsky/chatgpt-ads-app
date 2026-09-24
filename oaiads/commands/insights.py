@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import timedelta
+from datetime import date, timedelta
 
 from oaiads import api
 from oaiads.formatting import _die, _err, fmt_delta, fmt_money, fmt_num, print_table, _truncate
@@ -12,7 +12,7 @@ from oaiads.commands.common import ad_attention, brief_error, date_window, emit,
 LEVELS = ["account", "campaign", "ad_group", "ad"]
 LEVEL_WIRE = {"account": "ad_account", "campaign": "campaign", "ad_group": "ad_group", "ad": "ad"}
 GRANULARITIES = ["hourly", "daily", "monthly", "none"]
-SEGMENTS = ["product", "country", "device"]
+SEGMENTS = ["product", "country", "device", "platform"]  # platform: 2026-09-10 (apps + desktop/iOS/Android web)
 INCLUDES = ["zero_impression_items", "zero_impression_products"]
 METRICS = ["impressions", "clicks", "spend", "ctr", "cpc", "cpm"]
 DEFAULT_CHILD = {"account": "campaign", "campaign": "ad_group", "ad_group": "ad", "ad": "ad"}
@@ -77,7 +77,10 @@ def default_fields(agg: str, granularity: str, segment: str | None) -> list[str]
     if agg == "ad":
         fields.append("ad.review_status")
     if segment:
-        seg_meta = {"product": ["product.item_id", "product.title"], "country": ["country.name"], "device": ["device.type"]}
+        # `platform` is the canonical field itself (valid only with segments[]=platform); metrics come back as flat
+        # wire keys (clicks, spend) — live-verified 2026-09-24.
+        seg_meta = {"product": ["product.item_id", "product.title"], "country": ["country.name"], "device": ["device.type"],
+                    "platform": ["platform"]}
         fields += seg_meta[segment]
         fields += [f"{segment}.{m}" for m in METRICS]
     else:
@@ -120,6 +123,22 @@ def build_params(args, agg: str, since, until) -> list:
     return params
 
 
+# Reporting retention (docs → Reporting → Historical availability, 2026-09).
+RETENTION_DAYS = {"hourly": 30, "product": 30, "default": 365}
+
+
+def retention_warnings(since, granularity: str, segment: str | None) -> list[str]:
+    age = (date.today() - since).days
+    out = []
+    if granularity == "hourly" and age > RETENTION_DAYS["hourly"]:
+        out.append(f"hourly reporting keeps ~{RETENTION_DAYS['hourly']} days — --since {since} is older; expect missing rows.")
+    if segment == "product" and age > RETENTION_DAYS["product"]:
+        out.append(f"product reporting keeps ~{RETENTION_DAYS['product']} days — --since {since} is older; expect missing rows.")
+    if age > RETENTION_DAYS["default"]:
+        out.append(f"delivery reporting keeps the most recent {RETENTION_DAYS['default']} days — --since {since} is older.")
+    return out
+
+
 def fetch_insights(path: str, params: list, fetch_all: bool, max_items: int) -> list:
     if not fetch_all:
         data = api._api_call("GET", path, params)
@@ -137,6 +156,8 @@ def cmd_insights(args) -> None:
     if args.segment and args.granularity == "hourly":
         _die("ERROR: segmented requests support none/daily/monthly only.")
     since, until = date_window(args.days, args.since, args.until)
+    for msg in retention_warnings(since, args.granularity, args.segment):
+        _err(f"⚠ {msg}")
     path = _scope_path(args.level, args.object_id)
     params = build_params(args, agg, since, until)
     rows = fetch_insights(path, params, args.all, args.max_items)
@@ -145,16 +166,22 @@ def cmd_insights(args) -> None:
     def human(items):
         wire = LEVEL_WIRE[agg]
         seg = args.segment
+        # Segmented rows are entity × segment — show the entity too, or rows of different campaigns look duplicated.
+        with_entity = bool(seg) and agg != "account"
         headers = (["Time"] if args.granularity != "none" else []) + \
-                  ([{"product": "Product", "country": "Country", "device": "Device"}[seg]] if seg else [f"{agg} id", "Name"]) + \
+                  ([_truncate(agg, 12)] if with_entity else []) + \
+                  ([{"product": "Product", "country": "Country", "device": "Device", "platform": "Platform"}[seg]] if seg else [f"{agg} id", "Name"]) + \
                   ["Impr", "Clicks", "CTR %", "CPC", "CPM", "Spend"]
         table = []
         for r in items:
             row = []
             if args.granularity != "none":
                 row.append(r.get("readable_time", ""))
+            if with_entity:
+                row.append(_truncate(r.get(f"{wire}_name") or r.get(f"{wire}_id") or "", 30))
             if seg:
-                label = r.get("product_title") or r.get("item_id") or r.get("country_name") or r.get("device_type") or ""
+                label = (r.get("product_title") or r.get("item_id") or r.get("country_name") or r.get("device_type")
+                         or r.get("platform") or "")
                 row.append(_truncate(label, 36))
             else:
                 row += [r.get(f"{wire}_id") or r.get("id", ""), _truncate(r.get(f"{wire}_name") or r.get("name"), 36)]
@@ -171,6 +198,9 @@ def cmd_insights(args) -> None:
         print(f"Insights {since} → {until} ({api.account_timezone()}), scope {args.level}"
               f"{' ' + args.object_id if args.object_id else ''}, rows by {agg}, granularity {args.granularity}")
         print_table(table, headers)
+        if seg == "platform":
+            print("Platform rows: historical 'web' keeps combined web totals (not split retroactively); conversions are not "
+                  "available per platform.")
         tot_s = sum((metric(r, agg, 'spend', seg) or 0) for r in items)
         tot_i = sum((metric(r, agg, 'impressions', seg) or 0) for r in items)
         tot_c = sum((metric(r, agg, 'clicks', seg) or 0) for r in items)
@@ -233,8 +263,9 @@ def cmd_pulse(args) -> None:
     tz = api.account_timezone()
     cur = api.account_currency()
 
+    from oaiads.commands.account import fetch_spend_limits, fmt_daily_limit
     acct = api._api_call("GET", "/ad_account", soft=True)
-    windows = api._api_call("GET", "/ad_account/spend_limit_windows", soft=True)
+    windows = fetch_spend_limits()
 
     def campaign_rows(s, u):
         params = [("time_granularity", "none"), ("aggregation_level", "campaign"), ("limit", 500),
@@ -264,7 +295,7 @@ def cmd_pulse(args) -> None:
             unlinked = [c for c in campaigns_all.get("data", []) if c.get("status") == "active"
                         and not c.get("conversion_event_setting_ids")]
 
-    home = home_country_for_timezone(tz)
+    home = ((acct.get("origin_country_code") if isinstance(acct, dict) else None) or home_country_for_timezone(tz))
     foreign = []
     if home and isinstance(campaigns_all, dict) and "_error" not in campaigns_all:
         for c in campaigns_all.get("data", []):
@@ -273,6 +304,12 @@ def cmd_pulse(args) -> None:
             countries = campaign_countries(c)
             if countries and home not in countries:
                 foreign.append({"id": c.get("id"), "name": c.get("name"), "status": c.get("status"), "countries": sorted(countries)})
+
+    groups = api._api_call("GET", "/ad_groups", [(qarr("include"), "bid_too_low"), ("limit", 500)], soft=True)
+    bid_low = []
+    if isinstance(groups, dict) and "_error" not in groups:
+        bid_low = [{"id": g.get("id"), "name": g.get("name")} for g in groups.get("data", [])
+                   if g.get("bid_too_low") and g.get("status") == "active"]
 
     ads = api._api_call("GET", "/ads", [(qarr("include"), "serving_issues"), ("limit", 500)], soft=True)
     flagged, waiting, paused_only = [], [], []
@@ -299,7 +336,9 @@ def cmd_pulse(args) -> None:
         "window": {"since": str(since), "until": str(until), "previous_since": str(prev_since),
                    "previous_until": str(prev_until), "timezone": tz, "currency": cur},
         "account": acct if isinstance(acct, dict) else None,
-        "spend_limit_windows": (windows.get("data", windows) if isinstance(windows, dict) and "_error" not in windows else None),
+        "spend_limit_windows": (windows.get("data") or [] if "_error" not in windows else None),
+        "daily_spend_limit": (windows.get("daily_limit") if "_error" not in windows else None),
+        "ad_groups_bid_too_low": bid_low,
         "totals": tot, "previous_totals": prev, "conversions": conv_total,
         "campaigns": cur_rows, "previous_campaigns": prev_rows,
         "ads_needing_attention": flagged,
@@ -309,6 +348,7 @@ def cmd_pulse(args) -> None:
         "campaigns_targeting_foreign_country": foreign,
         "errors": {k: v for k, v in (("insights", err_cur or err_prev), ("conversions", brief_error(conv)),
                                     ("ads", brief_error(ads)), ("account", brief_error(acct)),
+                                    ("ad_groups", brief_error(groups)),
                                     ("spend_limits", brief_error(windows))) if v},
     }
 
@@ -320,11 +360,13 @@ def cmd_pulse(args) -> None:
             "  ⚠ NOT APPROVED — cannot serve" if review and review != "approved" else ""))
         wins = r["spend_limit_windows"]
         if wins is None and r["errors"].get("spend_limits"):
-            print(f"  spend limit windows: endpoint unavailable ({r['errors']['spend_limits']}) — rely on campaign daily budgets/end dates.")
+            print(f"  account spending limits: not readable ({r['errors']['spend_limits']}) — rely on campaign daily budgets/end dates.")
         if wins is not None:
-            active = [w for w in wins if str(w.get("status", "")).lower() in ("active", "scheduled")]
-            if not active:
-                print("  spend limit windows: NONE active — no account-level spend cap (spend-limit-create).")
+            if r["daily_spend_limit"]:
+                print(f"  daily account limit: {fmt_daily_limit(r['daily_spend_limit'], cur)}")
+            active = [w for w in wins if str(w.get("status", "")).lower() in ("active", "upcoming")]
+            if not active and not r["daily_spend_limit"]:
+                print("  account spending limits: NONE — no account-level cap (daily-spend-limit-set / spend-limit-create).")
             for w in active:
                 print(f"  spend cap {w.get('start_date')}→{w.get('end_date')}: "
                       f"{fmt_money(w.get('spent_micros'), cur)} of {fmt_money(w.get('amount_micros'), cur)} [{w.get('status')}]")
@@ -361,12 +403,16 @@ def cmd_pulse(args) -> None:
             else:
                 print("\n  No delivery in the window.")
         for c in r["campaigns_targeting_foreign_country"]:
-            print(f"\n  ⚠ campaign {c['id']} \"{c['name']}\" [{c['status']}] targets {c['countries']} while the account timezone "
-                  f"({tz}) suggests {home} — Ads Manager's auto-generated campaigns default to US. campaign-update --location-ids <country id>")
+            print(f"\n  ⚠ campaign {c['id']} \"{c['name']}\" [{c['status']}] targets {c['countries']} while the account's home country "
+                  f"(origin_country_code / timezone {tz}) is {home} — Ads Manager's auto-generated campaigns default to US. campaign-update --location-ids <country id>")
         if r["active_campaigns_without_conversion_event"]:
             names = ", ".join(c["id"] for c in r["active_campaigns_without_conversion_event"][:5])
             print(f"\n  ⚠ {len(r['active_campaigns_without_conversion_event'])} active campaign(s) with no conversion event linked ({names}) — "
                   "clicks only, no CPA. See conversion-check.")
+        if r["ad_groups_bid_too_low"]:
+            names = ", ".join(g["id"] for g in r["ad_groups_bid_too_low"][:5])
+            print(f"\n  ⚠ {len(r['ad_groups_bid_too_low'])} active ad group(s) flagged bid_too_low ({names}) — OpenAI's guidance that "
+                  "the bid may be too low for reliable delivery (adgroups --bid-check). Not a block; check impressions first.")
         if r["ads_needing_attention"]:
             print(f"\n  ⚠ {len(r['ads_needing_attention'])} ad(s) rejected / with serving issues — run ad-review.")
         elif not r["errors"].get("ads"):

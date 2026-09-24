@@ -53,6 +53,26 @@ def _add(findings: list, level: str, msg: str) -> None:
     findings.append((level, msg))
 
 
+# Documented 2026-09 (campaign-management → Tracking parameters): templates on several levels COMBINE;
+# for a duplicate key the most specific level wins. Macros: {campaign_id}, {ad_group_id}, {ad_id}, {oppref}.
+UTM_PRECEDENCE = "destination URL > ad > ad group > campaign > ad account"
+
+
+def utm_overlap(outer: str | None, inner: str | None) -> list[str]:
+    """Query keys set in BOTH templates (the inner, more specific level wins for those)."""
+    def keys(t):
+        return {p.split("=", 1)[0].strip().lower() for p in (t or "").split("&") if p.strip()}
+    return sorted(keys(outer) & keys(inner))
+
+
+def lint_utm_levels(outer: str | None, inner: str | None, findings: list, outer_label: str = "campaign",
+                    inner_label: str = "ad group") -> None:
+    dup = utm_overlap(outer, inner)
+    if dup:
+        _add(findings, "warn", f"UTM key(s) {dup} set on the {outer_label} AND the {inner_label} template — the {inner_label} "
+                               f"value wins for those keys (templates combine; precedence {UTM_PRECEDENCE}).")
+
+
 def lint_name(name: str | None, what: str, findings: list) -> None:
     if name is None:
         return
@@ -183,6 +203,8 @@ def lint_budget(budget: dict | None, findings: list) -> None:
     for k, v in budget.items():
         if v is not None and v < BUDGET_MIN_MICROS:
             _add(findings, "error", f"budget.{k} minimum is {BUDGET_MIN_MICROS} micros (1 currency unit).")
+    if budget.get("lifetime_spend_limit_micros") and budget.get("daily_spend_limit_micros"):
+        _add(findings, "error", "budget: exactly ONE of daily or lifetime — a campaign cannot have both (docs 2026-09).")
 
 
 def lint_times(start: int | None, end: int | None, findings: list) -> None:

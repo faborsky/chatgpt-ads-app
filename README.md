@@ -1,6 +1,6 @@
 # ChatGPT Ads App
 
-**Verze 1.4.1** · Python CLI pro reklamy v ChatGPT přes **OpenAI Advertiser API v1** (OpenAPI spec 2.3.0): 96 příkazů, všech 88 operací ze specifikace + Bulk API + `plan-apply` + `raw` escape hatch. Stavěné pro orchestraci AI agentem (Claude Code) i pro vlastní automatizace: `--json` výstupy, dry-run zápisy, idempotence, vlastní rate-limit budget.
+**Verze 1.5.0** · Python CLI pro reklamy v ChatGPT přes **OpenAI Advertiser API v1** (OpenAPI spec 2.3.0, stav 2026-09-24): 101 příkazů, všech 78 operací ze současné specifikace + Bulk API + `plan-apply` + `raw` escape hatch (+ 18 příkazů pro endpointy, které OpenAI ze specifikace stáhlo, vedené jako deprecated). Stavěné pro orchestraci AI agentem (Claude Code) i pro vlastní automatizace: `--json` výstupy, dry-run zápisy, idempotence, vlastní rate-limit budget.
 
 Novinky sleduj přes **Watch → Custom → Releases** na GitHubu, changelog je v [CHANGELOG.md](CHANGELOG.md).
 
@@ -11,7 +11,20 @@ Novinky sleduj přes **Watch → Custom → Releases** na GitHubu, changelog je 
 >
 > Nevíš, jak ji rozjet? Nebo chceš AI v marketingu používat systematicky: řídit z jednoho místa všechny kanály, automatizovat rutinu, postavit si vlastní znalostní bázi a vibe codovat si nástroje na míru své firmě? To učím v kurzu **[AI First](https://aifirst.cz)**. Tahle appka je v něm vysvětlená i s tím, jak si postavit vlastní.
 
-## 🆕 Co je nového (1.4.1)
+## 🆕 Co je nového (1.5.0)
+
+Srovnání appky s tím, co OpenAI do API přidalo po 2026-09-02 (changelog 9. a 10. září, přepracované docs, nová verze spec pod stejným číslem 2.3.0). Detail v [CHANGELOG.md](CHANGELOG.md) a [docs/api-notes.md](docs/api-notes.md#změny-api-2026-09-srovnání-2026-09-24).
+
+- **Denní limit útraty účtu** (`daily-spend-limit-set` / `daily-spend-limit-delete`): sdílený denní strop přes všechny kampaně, obnovuje se o půlnoci v timezone účtu. `spend-limits`, `account` i `pulse` ukazují denní limit vedle date-range oken. Jen pro účty na fakturu (postpaid invoice) a klíč s právem spravovat billing. Na self-serve klíči endpoint teď vrací 403 „Only ad account admins“ (dřív 404); CLI to hlásí jako „pojistka přes API nedostupná“, nepadá.
+- **Web rozdělený na platformy**: `--platforms` bere `desktop_web`, `ios_web`, `android_web` (plus `web` = všechny weby, `ios_app`, `android_app`); `--clear-platforms` zruší jen omezení platforem. Změna jen platforem pošle jen `platforms` (lokace a audiences zůstanou beze změny). `insights --segment platform` rozpadne výkon po platformách.
+- **`bid_too_low`**: OpenAI teď u sestavy hlásí, že bid je nejspíš moc nízký na spolehlivé doručování. Ukazuje ho `adgroup-detail`, `adgroups --bid-check` (sloupec) a `pulse` (počet aktivních sestav).
+- **Maximize Results podle nových docs**: `--strategy maximize_clicks|maximize_conversions` jde bez `--max-bid`; CLI hlídá, že kampaň má odpovídající cíl a **denní** budget, a při přepnutí zahodí bid i audience multiplikátory. Zpět na `fixed_bid` jen s explicitním bidem. Budget je vždy jeden (denní NEBO celkový) a denní se nedá přepnout zpět na celkový.
+- **UTM šablony se sčítají**: OpenAI zdokumentovalo, že šablony na kampani, sestavě a reklamě se kombinují a u duplicitního klíče vyhrává konkrétnější úroveň (URL > reklama > sestava > kampaň > účet). Lint varuje jen na duplicitní klíče.
+- **Audience operace**: `audience-operations` (výpis), `audience-operation-resume` (dokončí přerušené add/remove), `audience-operation-cancel` (zruší add/remove před aplikací); polling při `409 recovery_required` rovnou poradí resume.
+- **Opraveno**: `campaign_ended` (kampaň po konci) už není „problém“ v `pulse`/`ad-review` (viděno živě, většina hlášených „problémů“); segmentované insights ukazují i kampaň (řádky vypadaly zdvojeně); `pulse` pozná domovskou zemi z nového pole `origin_country_code`.
+- **Deprecated**: negativní klíčová slova, lead formuláře a Business Agents zmizely z veřejné specifikace. Příkazy zůstávají, na stderr upozorní a ve 2.0 odejdou. Lead sync ve specifikaci zůstal.
+
+### 1.4.1
 
 - **Ověření po zápisu už neklame**: detail je po zápisu chvíli zastaralý (pauza sestavy → re-read ještě říkal `active`). CLI ho teď čte až 3× s pauzou a „Verified via detail“ napíše jen když očekávaný stav sedí; jinak řekne, že detail ještě ukazuje starý stav a ať se zkontroluje `*-detail` za pár sekund.
 - **`plan-apply` na stovky objektů**: souhrn (počty, zápisy, odhad délky běhu) je **před** stromem, opakovaná lint varování se skládají do jednoho řádku s počtem (`--verbose-lint` je rozepíše).
@@ -132,11 +145,11 @@ OPENAI_ADS_API_KEY=<klíč>                       # jeden účet
 ./run.sh spend-limit-create --start 2026-09-02 --end 2026-10-01 --amount 500 --name "Září cap" --confirm
 ```
 
-**Spend limit window je account-level strop útraty** (start inkluzivní, konec exkluzivní). Nastav ho, než na účet s kartou pustíš agenta. **Pozor:** na self-serve účtu endpoint zatím vrací 404 (2026-09-02). Pak je pojistkou denní budget kampaně (útrata může být až 2× za den) + `--end`, a `pulse` na sledování.
+**Account spending limit je strop útraty celého účtu**: denní (`daily-spend-limit-set`, obnovuje se o půlnoci) nebo na období (`spend-limit-create`, start inkluzivní, konec exkluzivní). Nastav ho, než na účet pustíš agenta. **Pozor:** limity jsou jen pro účty na fakturu (postpaid invoice) a klíč s právem spravovat billing; self-serve klíč dostane 403 „Only ad account admins“ (2026-09-24). Pak je pojistkou denní budget kampaně (útrata může být až 2× za den) + `--end`, a `pulse` na sledování.
 
 ## Prerekvizity před první kampaní
 
-ChatGPT Ads jsou systémová integrace, ne položka v mediaplánu. Než něco pustíš, musí sedět: schválený brand review + platební metoda, **spend limit window**, landing page dostupná pro **OAI-AdsBot** (robots.txt i WAF/CDN), **oppref přežije redirecty**, nasazené měření (pixel a/nebo Conversions API se sdíleným event id, consent hook, CSP) **napojené na kampaň** (i na CPC, jinak porovnáváš CPC místo ceny za zákazníka), u e-shopů feed s `is_ads_eligible` a automatickou synchronizací (položky expirují po 14 dnech).
+ChatGPT Ads jsou systémová integrace, ne položka v mediaplánu. Než něco pustíš, musí sedět: schválený brand review + platební metoda, **limit útraty účtu** (kde je dostupný, jinak denní budget + konec kampaně), landing page dostupná pro **OAI-AdsBot** (robots.txt i WAF/CDN), **oppref přežije redirecty**, nasazené měření (pixel a/nebo Conversions API se sdíleným event id, consent hook, CSP) **napojené na kampaň** (i na CPC, jinak porovnáváš CPC místo ceny za zákazníka), u e-shopů feed s `is_ads_eligible` a automatickou synchronizací (položky expirují po 14 dnech).
 
 Pozor na založení účtu: osobní účet nemá právo zakládat ad accounty v tenantu. Funguje firemní e-mail + pozvánka (viz playbook §7). Všechno kromě měření ověří `./run.sh landing-check --url …` a `./run.sh account`. Kompletní checklist, pravidla pro context hints (popisuj situace, ne klíčová slova), doporučené délky textů (~16 / ~32 znaků), bidding a fakturační pasti: [skill/chatgpt-ads/chatgpt-ads-campaign-playbook.md](skill/chatgpt-ads/chatgpt-ads-campaign-playbook.md).
 
@@ -161,7 +174,7 @@ cp docs/plan-example.json plan.json        # uprav: budget, end, location_ids, e
 ./run.sh plan-apply --file plan.json --confirm --update-existing   # a sesynchronizuje to (status nikdy; kreativa → nové review)
 ```
 
-Plán umí i `"campaign": {"id": "cmpn_existing"}` (jen přidat sestavy a reklamy do existující kampaně), `defaults` pro sestavy/reklamy, `hints_file` (řádek = hint), sdílený `image_file` nebo `image_url`, **celou UTM šablonu per sestava** přes `query_string_template` (kampaňovou šablonu nepoužívej: precedence kampaň vs. sestava není ověřená a sestavová může kampaňovou celou nahradit; lint na to upozorní).
+Plán umí i `"campaign": {"id": "cmpn_existing"}` (jen přidat sestavy a reklamy do existující kampaně), `defaults` pro sestavy/reklamy, `hints_file` (řádek = hint), sdílený `image_file` nebo `image_url`, UTM šablonu přes `query_string_template` na kampani i sestavě: šablony se **sčítají** a u duplicitního klíče vyhrává sestava (lint duplicitní klíče ukáže). Funguje celá šablona na sestavě (ověřeno v provozu) i rozdělení `utm_source/medium/campaign` na kampani + `utm_content` na sestavě (podle docs, živě zatím neověřeno).
 
 **Velké plány** (stovky objektů): souhrn je před stromem, opakovaná lint varování jednoho druhu se skládají do jednoho řádku s počtem a maximem (`--verbose-lint` vypíše každé). Chyby proti spec limitům zůstávají u objektu.
 
@@ -191,14 +204,16 @@ API limituje **600 req/min na endpoint a 1 200 req/min celkem, per ad account i
 
 | Příkaz | Co dělá | Klíčové flagy |
 |---|---|---|
-| `account` | Účet: status, brand review, měna, tz, negativní klíčová slova, spend capy | `--json` |
+| `account` | Účet: status, brand/integrity review, měna, tz, domovská země, limity útraty | `--json` |
 | `accounts` | Účty dostupné s tímto klíčem + lokálně nakonfigurované | |
 | `brand-update` [write] | Název / URL / favicon účtu → nový brand review | `--name`, `--url`, `--favicon-file-id` |
-| `negative-keywords` | Account-level negativní klíčová slova (na self-serve účtu zatím nedostupné, CLI to hlásí) | |
-| `negative-keywords-set` [write] | **Nahradí** celý seznam (max 100 × 100 znaků) | `--keywords a,b`, `--keywords-file` |
-| `negative-keywords-add` / `negative-keywords-remove` [write] | Přidá / odebere (read-modify-write) | `--keywords` |
-| `spend-limits` | Spend limit windows (strop útraty účtu) | |
-| `spend-limit-create` [write] | Nové okno (start inkluzivní, **end exkluzivní**) | `--start`, `--end`, `--amount`, `--name`, `--io-id` |
+| `negative-keywords` ⚠ deprecated | Account-level negativní klíčová slova (stažené ze spec 2026-09; na self-serve nikdy nefungovalo) | |
+| `negative-keywords-set` [write] ⚠ deprecated | **Nahradí** celý seznam (max 100 × 100 znaků) | `--keywords a,b`, `--keywords-file` |
+| `negative-keywords-add` / `negative-keywords-remove` [write] ⚠ deprecated | Přidá / odebere (read-modify-write) | `--keywords` |
+| `spend-limits` | Limity útraty účtu: denní limit (vč. dnešní útraty a zbytku) + date-range okna + `revision` | |
+| `daily-spend-limit-set` [write] | Denní limit účtu (nový od zítřka; úprava částky / konce); guard `expected_revision` (CLI si ho načte) | `--amount`, `--start` (jen nový), `--end` / `--no-end`, `--expected-revision` |
+| `daily-spend-limit-delete` [write] | Zruší denní limit (date-range okna zůstanou) | `--expected-revision` |
+| `spend-limit-create` [write] | Nové date-range okno (start inkluzivní, **end exkluzivní**) | `--start`, `--end`, `--amount`, `--name`, `--io-id` |
 | `spend-limit-update` / `spend-limit-delete` [write] | Úprava / smazání okna | `--window-id` |
 | `account-pause` / `account-activate` [write] | Pauza / aktivace celého účtu | |
 | `api-limits` | Lokální budget vs. dokumentované limity | |
@@ -211,20 +226,20 @@ API limituje **600 req/min na endpoint a 1 200 req/min celkem, per ad account i
 |---|---|---|
 | `campaigns` | Seznam (archived skryté) | `--status`, `--all`, `--name`, `--include-issues`, `--order`, `--wide`, `--limit` |
 | `campaign-detail` | Detail vč. targetingu a serving issues; `--with-children` = celý strom (sestavy + reklamy + review) | `--campaign-id`, `--with-children` |
-| `campaign-create` [write] | Nová kampaň (paused) | `--name`, `--lifetime-budget` / `--daily-budget`, `--bidding-type impressions\|clicks\|conversions`, `--countries CZ,SK`, `--location-ids`, `--exclude-location-ids`, `--audience-ids`, `--exclude-audience-ids`, `--platforms web,ios_app,android_app`, `--start`, `--end`, `--description`, `--conversion-event-setting-id` (napojení eventu pro reporting; u oCPC přesně jeden), `--mode` + `--product-feed-id` / `--business-agent-id`, `--query-string-template`, `--targeting-json` |
-| `campaign-update` [write] | Úprava (budget = celý objekt, targeting se mergne); po zápisu dotáhne detail | totéž + `--campaign-id`, `--status`, `--clear-end-time`, `--clear-targeting` |
+| `campaign-create` [write] | Nová kampaň (paused) | `--name`, `--lifetime-budget` / `--daily-budget`, `--bidding-type impressions\|clicks\|conversions`, `--countries CZ,SK`, `--location-ids`, `--exclude-location-ids`, `--audience-ids`, `--exclude-audience-ids`, `--platforms` (`web` = všechny weby, `desktop_web`, `ios_web`, `android_web`, `ios_app`, `android_app`), `--start`, `--end`, `--description`, `--conversion-event-setting-id` (napojení eventu pro reporting; u oCPC přesně jeden), `--mode` + `--product-feed-id` / `--business-agent-id`, `--query-string-template`, `--targeting-json` |
+| `campaign-update` [write] | Úprava (budget = celý objekt; lokace/audiences se mergnou do současného targetingu, samotná změna platforem pošle jen `platforms`); po zápisu dotáhne detail | totéž + `--campaign-id`, `--status`, `--clear-end-time`, `--clear-targeting`, `--clear-platforms` |
 | `plan-apply` [write] | **Celá kampaň z jednoho JSON** (kampaň → sestavy → reklamy), dry-run = strom + lint, `--confirm` = sekvenční zápis s resume přes `plan.state.json`; opakovaný běh vypíše rozdíly (↻) a s `--update-existing` je sesynchronizuje (status nikdy) | `--file plan.json`, `--state`, `--update-existing`, `--verbose-lint` |
 | `campaign-activate` / `campaign-pause` / `campaign-archive` [write] | Stavové přechody (archive nevratný, brzda na paused) | `--campaign-id`, `--force` |
 
-`bidding_type`, `mode` a oCPC event setting **po vytvoření nejde změnit**.
+`bidding_type`, `mode` a oCPC event setting **po vytvoření nejde změnit**. Budget je vždy jeden (denní NEBO celkový); celkový jde přepnout na denní, zpět ne.
 
 ### Ad groups
 
 | Příkaz | Co dělá | Klíčové flagy |
 |---|---|---|
-| `adgroups` | Seznam (volitelně po kampani) | `--campaign-id`, `--status`, `--all`, `--name`, `--include-issues`, `--limit` |
-| `adgroup-detail` | Detail vč. biddingu, hints, product setu | `--ad-group-id`, `--with-children` |
-| `adgroup-create` [write] | Nová ad group (paused); billing event se odvodí z kampaně | `--campaign-id`, `--name`, `--max-bid` (per event) / `--max-cpm`, `--billing-event impression\|click`, `--strategy fixed_bid\|maximize_clicks\|maximize_conversions`, `--hints "a, b"` (opak.), `--hints-file`, `--audience-multiplier caud=2.0`, `--product-feed-id` + `--product-filter brand:in:X\|Y`, `--product-set-json`, `--description`, `--query-string-template` |
+| `adgroups` | Seznam (volitelně po kampani); `--bid-check` přidá sloupec `bid_too_low` | `--campaign-id`, `--status`, `--all`, `--name`, `--include-issues`, `--bid-check`, `--limit` |
+| `adgroup-detail` | Detail vč. biddingu, hints, product setu a varování `bid_too_low` | `--ad-group-id`, `--with-children` |
+| `adgroup-create` [write] | Nová ad group (paused); billing event se odvodí z kampaně | `--campaign-id`, `--name`, `--max-bid` (per event) / `--max-cpm`, `--billing-event impression\|click`, `--strategy fixed_bid\|maximize_clicks\|maximize_conversions` (Maximize Results: bez bidu, jen click kampaň s cílem clicks/conversions a denním budgetem, bez audience multiplikátorů), `--hints "a, b"` (opak.), `--hints-file`, `--audience-multiplier caud=2.0`, `--product-feed-id` + `--product-filter brand:in:X\|Y` (vlastní štítky `ads_metadata.custom_label_0:in:…`), `--product-set-json`, `--description`, `--query-string-template` |
 | `adgroup-update` [write] | Úprava (bidding_config se pošle celý, hints se nahradí) | totéž + `--ad-group-id`, `--status` |
 | `adgroup-activate` / `adgroup-pause` / `adgroup-archive` [write] | Stavové přechody | `--ad-group-id`, `--force` |
 
@@ -251,9 +266,9 @@ API limituje **600 req/min na endpoint a 1 200 req/min celkem, per ad account i
 
 | Příkaz | Co dělá | Klíčové flagy |
 |---|---|---|
-| `insights` | Výkon (impressions, clicks, spend, CTR, CPC, CPM) pro účet / kampaň / ad group / ad | `--level`, `--object-id`, `--aggregation-level`, `--granularity hourly\|daily\|monthly\|none`, `--since`, `--until`, `--days`, `--timezone`, `--fields`, `--filter JSON` (opak.), `--sort field:desc`, `--segment product\|country\|device`, `--segment-first`, `--include`, `--limit`, `--all` |
+| `insights` | Výkon (impressions, clicks, spend, CTR, CPC, CPM) pro účet / kampaň / ad group / ad | `--level`, `--object-id`, `--aggregation-level`, `--granularity hourly\|daily\|monthly\|none`, `--since`, `--until`, `--days`, `--timezone`, `--fields`, `--filter JSON` (opak.), `--sort field:desc`, `--segment product\|country\|device\|platform`, `--segment-first`, `--include`, `--limit`, `--all` |
 | `conversion-insights` | Atribuované konverze (click-through + view-through); bez `--ids` jeden součtový řádek za účet, s `--ids` / `--group-by-entity` řádek per entita (bez `--ids` si vylistuje nearchivované objekty úrovně) | `--level`, `--ids`, `--group-by-entity`, `--granularity none\|daily`, `--breakdown device\|country`, `--include-zero`, `--since`, `--until`, `--days`, `--timezone` |
-| `pulse` | Digest účtu: období vs. předchozí, spend capy, konverze (součet za účet), ⚠ zamítnuté / serving issues, ℹ čeká na review | `--days` |
+| `pulse` | Digest účtu: období vs. předchozí, limity útraty (denní + okna), konverze (součet za účet), ⚠ zamítnuté / serving issues, ⚠ sestavy s `bid_too_low`, kampaně cílící mimo domovskou zemi, ℹ čeká na review | `--days` |
 
 ### Cílení
 
@@ -274,7 +289,10 @@ Nejsou dostupné pro cílení na EEA/Švýcarsko. Membership operace jsou asynch
 | `audience-replace` [write] | Nahradí celé členství souborem | `--audience-id`, `--file-id`, `--expected-revision` |
 | `audience-merge` [write] | 2–64 audiences → nová | `--name`, `--ids` |
 | `audience-archive` [write] | Archivace (permanentní) | `--audience-id` |
-| `audience-operation` | Poll operace | `--audience-id`, `--operation-id`, `--wait` |
+| `audience-operation` | Poll operace (při `409 recovery_required` poradí resume) | `--audience-id`, `--operation-id`, `--wait` |
+| `audience-operations` | Výpis uchovaných operací audience (add/remove/replace/merge; stránkuje přes `next_cursor`) | `--audience-id`, `--limit` |
+| `audience-operation-resume` [write] | Dokončí přerušené add/remove se stejným id a vstupem (bez těla a klíče) | `--audience-id`, `--operation-id` |
+| `audience-operation-cancel` [write] | Zruší add/remove, než se začne aplikovat (úspěch = status `failed`; replace/merge zrušit nejde) | `--audience-id`, `--operation-id` |
 
 ### Konverze
 
@@ -303,6 +321,8 @@ Nejsou dostupné pro cílení na EEA/Švýcarsko. Membership operace jsou asynch
 
 ### Lead formuláře a lead sync
 
+Lead formuláře OpenAI v 2026-09 stáhlo z veřejné specifikace: příkazy `lead-form*` jsou **deprecated** (na stderr upozorní, ve 2.0 odejdou; na self-serve účtech vracely 403). Lead sync ve specifikaci zůstává.
+
 | Příkaz | Co dělá | Klíčové flagy |
 |---|---|---|
 | `lead-forms` / `lead-form-detail` | Seznam / detail (i konkrétní revize) | `--all` / `--lead-form-id`, `--rev-id` |
@@ -315,6 +335,8 @@ Nejsou dostupné pro cílení na EEA/Švýcarsko. Membership operace jsou asynch
 | `lead-sync-delete` [write] | Zrušení subscription | `--subscription-id` |
 
 ### Business Agents
+
+**Deprecated**: endpointy Business Agents zmizely z veřejné specifikace (2026-09; na self-serve vracely 403). Příkazy zůstávají pro účty, kterým je OpenAI zapnulo, a ve 2.0 odejdou.
 
 | Příkaz | Co dělá | Klíčové flagy |
 |---|---|---|

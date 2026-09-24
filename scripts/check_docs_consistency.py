@@ -9,8 +9,8 @@ Checks:
     in README / CLAUDE.md / docs / bundled skill.
  5. The bundled skill still carries the <CHATGPT_ADS_APP_DIR> placeholder.
 
-Parser/dispatch parity is guaranteed by construction (one _cmd() call per
-command in oaiads/cli.py). Exit 0 = OK, exit 1 = findings (stderr).
+Commands are read from the real parser (build_parser); parser/dispatch parity is
+guaranteed by construction (one _cmd() call per command in oaiads/cli.py). Exit 0 = OK, exit 1 = findings (stderr).
 """
 
 from __future__ import annotations
@@ -46,16 +46,11 @@ def read(path: str) -> str:
 
 
 def cli_commands() -> list[str]:
-    src = read("oaiads/cli.py")
-    names = re.findall(r'_cmd\(sub, "([a-z0-9-]+)"', src)
-    # f-string registrations inside loops: f"campaign-{action}" etc.
-    for prefix, actions in re.findall(r'_cmd\(sub, f"([a-z0-9-]+)\{action\}", fn, [^)]*?\)\s*\n', src):
-        pass
-    loops = re.findall(r'for action, fn in \((.*?)\):\s*\n\s*sp = _cmd\(sub, f"([a-z0-9-]+)\{action\}"', src, flags=re.S)
-    for tuple_src, prefix in loops:
-        for action in re.findall(r'\("([a-z]+)",', tuple_src):
-            names.append(f"{prefix}{action}")
-    return names
+    """Registered subcommands, read from the real argparse parser (regexes over cli.py broke on loop shapes)."""
+    sys.path.insert(0, BASE)
+    from oaiads.cli import build_parser  # noqa: E402  (needs the app's requirements installed)
+    sub = next(a for a in build_parser()._actions if a.dest == "command")
+    return list(sub.choices)
 
 
 def main() -> int:
@@ -64,9 +59,7 @@ def main() -> int:
     if not commands:
         print("FATAL: no commands discovered in oaiads/cli.py", file=sys.stderr)
         return 1
-    dupes = {c for c in commands if commands.count(c) > 1}
-    if dupes:
-        findings.append(f"duplicate command registrations: {sorted(dupes)}")
+    # (argparse itself rejects duplicate subcommand names at build time)
 
     readme = read("README.md")
     for cmd in commands:

@@ -197,20 +197,86 @@ def cmd_audience_archive(args) -> None:
     run_write("POST", path, None, args, f"Audience {args.audience_id} archived (permanent).", idempotent=True)
 
 
+RECOVERY_HINT = ("409 custom_audience_operation_recovery_required: the add/remove was interrupted and may be PARTIALLY applied. "
+                 "Resume it by id — audience-operation-resume --audience-id {aid} --operation-id {op} --confirm — then poll again. "
+                 "Do NOT submit a new or inverse operation to guess at recovery (replace/merge: retry the original request with "
+                 "its original Idempotency-Key instead).")
+
+
 def cmd_audience_operation(args) -> None:
     path = f"/custom_audiences/{args.audience_id}/operations/{args.operation_id}"
     delays = [3, 5, 10, 20, 30, 60]
     attempt = 0
     deadline = time.time() + args.wait_timeout
     while True:
-        op = api._api_call("GET", path)
-        status = op.get("status")
-        if not args.wait or status in ("succeeded", "failed") or time.time() > deadline:
-            break
+        op = api._api_call("GET", path, soft=True)
+        err = op.get("_error") if isinstance(op, dict) else None
+        if err:
+            code = err.get("code") or ""
+            if code == "custom_audience_operation_recovery_required":
+                _die("ERROR: " + RECOVERY_HINT.format(aid=args.audience_id, op=args.operation_id))
+            if code == "custom_audience_operation_unavailable" and args.wait and time.time() <= deadline:
+                _err("  status temporarily unavailable (503) — not a failure; retrying…")
+            else:
+                _die(f"ERROR: HTTP {err.get('status')} {code}: {err.get('message')}")
+            status = None
+        else:
+            status = op.get("status")
+            if not args.wait or status in ("succeeded", "failed") or time.time() > deadline:
+                break
         delay = delays[min(attempt, len(delays) - 1)]
-        _err(f"  {status}… next check in {delay}s")
+        _err(f"  {status or 'unavailable'}… next check in {delay}s")
         time.sleep(delay)
         attempt += 1
     emit(op, args, lambda o: print(f"operation {o.get('operation_id')} ({o.get('operation')}) on {o.get('custom_audience_id')}: {o.get('status')}"))
     if op.get("status") == "failed":
-        _err("Operation failed — reconcile before submitting another change; contact support with the operation id if needed.")
+        _err("Operation failed (a cancelled operation also reports failed) — reconcile before submitting another change; "
+             "contact support with the operation id if needed.")
+
+
+def cmd_audience_operations(args) -> None:
+    """GET /custom_audiences/{id}/operations — cursor paging via next_cursor (not after/last_id)."""
+    path = f"/custom_audiences/{args.audience_id}/operations"
+    rows: list = []
+    cursor = None
+    while True:
+        params: list = [("limit", min(max(args.limit, 1), 100))]
+        if cursor:
+            params.append(("cursor", cursor))
+        page = api._api_call("GET", path, params)
+        rows += page.get("data") or []
+        cursor = page.get("next_cursor")
+        # Docs: keep going until has_more is false, even when a page's data is empty.
+        if not page.get("has_more") or not cursor or len(rows) >= args.max_items:
+            break
+    def human(items):
+        print_table([[o.get("operation_id"), o.get("operation"), o.get("status")] for o in items],
+                    ["Operation", "Type", "Status"])
+        print(f"\n{len(items)} retained operation(s) (add/remove/replace/merge; the initial create is not listed). "
+              "For a merge, list the NEW audience id.")
+
+    emit(rows, args, human)
+
+
+def _operation_action(args, action: str, note: str, done: str) -> None:
+    path = f"/custom_audiences/{args.audience_id}/operations/{args.operation_id}/{action}"
+    # No body and no Idempotency-Key (docs); both actions are safe to repeat, so transient retries are fine.
+    resp = run_write("POST", path, None, args, "", idempotent=True, note=note)
+    if resp is not None and not args.json:
+        print(f"{done}: operation {resp.get('operation_id')} ({resp.get('operation')}) status {resp.get('status')}. "
+              f"Poll: audience-operation --audience-id {args.audience_id} --operation-id {args.operation_id} --wait")
+
+
+def cmd_audience_operation_resume(args) -> None:
+    _operation_action(args, "resume",
+                      "Resumes an interrupted ADD/REMOVE with its original inputs and saved progress (same operation id). "
+                      "A finished operation keeps its status — resume only finishes cleanup. Replace/merge cannot be resumed.",
+                      "resume accepted")
+
+
+def cmd_audience_operation_cancel(args) -> None:
+    _operation_action(args, "cancel",
+                      "Cancels an accepted ADD/REMOVE before it starts applying changes; success reports status 'failed' "
+                      "(there is no 'canceled'). 409 custom_audience_mutation_conflict = already applying or succeeded; "
+                      "503 = retry the cancel for the same id. Replace/merge cannot be cancelled; nothing already applied is undone.",
+                      "cancel accepted")

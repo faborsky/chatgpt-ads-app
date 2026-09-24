@@ -12,6 +12,7 @@ from oaiads.commands.common import (
 
 BILLING_EVENTS = ["impression", "click"]
 STRATEGIES = ["fixed_bid", "maximize_clicks", "maximize_conversions"]
+MAXIMIZE_STRATEGIES = {"maximize_clicks": "clicks", "maximize_conversions": "conversions"}  # strategy → campaign bidding_type
 PRODUCT_FILTER_OPS = ["in", "not_in", "gt", "gte", "lt", "lte", "contains", "not_contains", "starts_with"]
 PRODUCT_FILTER_FIELDS = ["title", "body", "item_id", "offer_id", "price", "target_url", "image_url",
                          "product_category", "brand", "seller_name", "external_seller_id", "star_rating",
@@ -28,6 +29,8 @@ def _list_params(args) -> list:
         params.append(("name", args.name))
     if getattr(args, "include_issues", False):
         params.append((qarr("include"), "serving_issues"))
+    if getattr(args, "bid_check", False):
+        params.append((qarr("include"), "bid_too_low"))
     if getattr(args, "order", None):
         params.append(("order", args.order))
     return params
@@ -43,15 +46,23 @@ def cmd_adgroups(args) -> None:
                       (g.get("bidding_config") or {}).get("billing_event_type"),
                       (g.get("bidding_config") or {}).get("strategy") or "",
                       fmt_money((g.get("bidding_config") or {}).get("max_bid_micros"), cur),
-                      len(g.get("context_hints") or []), _truncate(issues_str(g), 40)] for g in items],
-                    ["ID", "Name", "Status", "Billing", "Strategy", "Max bid/event", "Hints", "Issues"])
+                      len(g.get("context_hints") or []),
+                      *([("⚠ yes" if g.get("bid_too_low") else "no")] if args.bid_check else []),
+                      _truncate(issues_str(g), 40)] for g in items],
+                    ["ID", "Name", "Status", "Billing", "Strategy", "Max bid/event", "Hints",
+                     *(["Bid too low"] if args.bid_check else []), "Issues"])
         print(f"\n{len(items)} ad group(s)" + ("" if args.all or args.status else " (archived hidden — use --all)"))
+        if args.bid_check:
+            low = [g for g in items if g.get("bid_too_low")]
+            print(f"bid_too_low: {len(low)} of {len(items)} — guidance, not a block; not raised for inactive ad groups "
+                  "or within 24 h of an ad-group update.")
 
     emit(rows, args, human)
 
 
 def cmd_adgroup_detail(args) -> None:
-    g = api._api_call("GET", f"/ad_groups/{args.ad_group_id}", [(qarr("include"), "serving_issues")])
+    # include[]=bid_too_low: documented 2026-09 (not in the spec enum yet), live-verified 2026-09-24.
+    g = api._api_call("GET", f"/ad_groups/{args.ad_group_id}", [(qarr("include"), "serving_issues"), (qarr("include"), "bid_too_low")])
     if args.with_children:
         g["_ads"] = api._fetch_all("/ads", [("ad_group_id", args.ad_group_id), (qarr("include"), "serving_issues")])
     cur = api.account_currency()
@@ -73,6 +84,9 @@ def cmd_adgroup_detail(args) -> None:
             print(f"  landing page config: {g['landing_page_configuration']}")
         print(f"  created {fmt_ts(g.get('created_at'))}  updated {fmt_ts(g.get('updated_at'))}")
         print(f"  serving issues: {issues_str(g) or 'none'}")
+        if g.get("bid_too_low"):
+            print("  ⚠ bid_too_low: the bid may be too low for reliable delivery (guidance, not a block; "
+                  "not raised for inactive ad groups or within 24 h of an ad-group update)")
         if "_ads" in g:
             print(f"\n  Ads ({len(g['_ads'])}):")
             for a in g["_ads"]:
@@ -111,8 +125,9 @@ def _product_set_from_args(args) -> dict | None:
         if len(parts) != 3:
             _die(f"ERROR: --product-filter format is field:operator:value1|value2 (got '{spec}').")
         field, op, values = parts
-        if field not in PRODUCT_FILTER_FIELDS:
-            _err(f"⚠ product filter field '{field}' is not in the documented list {PRODUCT_FILTER_FIELDS}.")
+        if field not in PRODUCT_FILTER_FIELDS and not field.startswith("ads_metadata."):
+            _err(f"⚠ product filter field '{field}' is not in the documented list {PRODUCT_FILTER_FIELDS} "
+                 "(custom labels: ads_metadata.<key>).")
         if op not in PRODUCT_FILTER_OPS:
             _die(f"ERROR: operator '{op}' not in {PRODUCT_FILTER_OPS}.")
         if op in ("gt", "gte", "lt", "lte") and field not in ("price", "star_rating"):
@@ -152,6 +167,16 @@ def _bidding_from_args(args, current: dict | None, campaign_bidding_type: str | 
         bc["max_bid_micros"] = money_flag(args.max_bid, "--max-bid", 1)
     if args.strategy:
         bc["strategy"] = args.strategy
+    if bc.get("strategy") in MAXIMIZE_STRATEGIES:
+        # Maximize Results: OpenAI sets the bid — max_bid_micros must be omitted and audience multipliers cleared.
+        if args.max_bid is not None or args.max_cpm is not None:
+            _die(f"ERROR: {bc['strategy']} sets bids automatically — drop --max-bid/--max-cpm (or use --strategy fixed_bid).")
+        if args.audience_multiplier:
+            _die("ERROR: audience bid multipliers work only with --strategy fixed_bid.")
+        bc.pop("max_bid_micros", None)
+        if bc.get("custom_audience_bid_multipliers") or current:
+            bc["custom_audience_bid_multipliers"] = []
+        return bc
     if args.audience_multiplier is not None:
         mults = []
         for spec in args.audience_multiplier:
@@ -164,8 +189,24 @@ def _bidding_from_args(args, current: dict | None, campaign_bidding_type: str | 
             mults.append({"custom_audience_id": aid.strip(), "bid_multiplier_micros": micros})
         bc["custom_audience_bid_multipliers"] = mults
     if not bc.get("max_bid_micros") and bc.get("strategy", "fixed_bid") == "fixed_bid":
-        _die("ERROR: --max-bid (or --max-cpm) is required.")
+        _die("ERROR: --max-bid (or --max-cpm) is required for fixed_bid (switching back from Maximize Results needs an explicit bid).")
     return bc
+
+
+def check_maximize(bidding: dict | None, campaign: dict, findings: list) -> None:
+    """Maximize Results compatibility (docs 2026-09): matching objective, click billing, DAILY campaign budget."""
+    strategy = (bidding or {}).get("strategy")
+    if strategy not in MAXIMIZE_STRATEGIES:
+        return
+    need = MAXIMIZE_STRATEGIES[strategy]
+    if campaign.get("bidding_type") and campaign.get("bidding_type") != need:
+        findings.append(("error", f"{strategy} needs a {need} campaign (this one is {campaign.get('bidding_type')})."))
+    if bidding.get("billing_event_type") != "click":
+        findings.append(("error", f"{strategy} needs billing_event_type=click."))
+    budget = campaign.get("budget") or {}
+    if budget and not budget.get("daily_spend_limit_micros"):
+        findings.append(("error", f"{strategy} needs a DAILY campaign budget — switch the campaign first "
+                                  f"(campaign-update --daily-budget; lifetime→daily only, never back)."))
 
 
 def cmd_adgroup_create(args) -> None:
@@ -174,7 +215,7 @@ def cmd_adgroup_create(args) -> None:
     campaign = api._api_call("GET", f"/campaigns/{args.campaign_id}")
     bidding = _bidding_from_args(args, None, campaign.get("bidding_type"))
     if bidding is None:
-        _die("ERROR: --max-bid (per event) or --max-cpm is required.")
+        _die("ERROR: --max-bid (per event) or --max-cpm is required (or --strategy maximize_clicks|maximize_conversions).")
     if campaign.get("bidding_type") == "impressions" and bidding["billing_event_type"] != "impression":
         findings.append(("error", "impression campaign needs billing_event_type=impression."))
     if campaign.get("bidding_type") in ("clicks", "conversions") and bidding["billing_event_type"] != "click":
@@ -197,10 +238,9 @@ def cmd_adgroup_create(args) -> None:
         body["product_set"] = ps
     if args.query_string_template:
         body["landing_page_configuration"] = {"query_string_template": args.query_string_template}
-        if (campaign.get("landing_page_configuration") or {}).get("query_string_template"):
-            findings.append(("warn", "the campaign also has a query_string_template — precedence is unverified and the ad-group "
-                                     "template may replace it entirely (utm_source/medium/campaign lost). Put the FULL UTM "
-                                     "set on the ad group and clear the campaign one."))
+        lint.lint_utm_levels((campaign.get("landing_page_configuration") or {}).get("query_string_template"),
+                             args.query_string_template, findings)
+    check_maximize(bidding, campaign, findings)
     if args.status == "active":
         findings.append(("warn", "Creating the ad group ACTIVE (default paused)."))
     if lint.report(findings):
@@ -235,6 +275,11 @@ def cmd_adgroup_update(args) -> None:
     bidding = _bidding_from_args(args, current.get("bidding_config"), None)
     if bidding is not None:
         body["bidding_config"] = bidding
+        if bidding.get("strategy") in MAXIMIZE_STRATEGIES and current.get("campaign_id"):
+            check_maximize(bidding, api._api_call("GET", f"/campaigns/{current['campaign_id']}"), findings)
+    if args.query_string_template and current.get("campaign_id"):
+        lint.lint_utm_levels((api._api_call("GET", f"/campaigns/{current['campaign_id']}").get("landing_page_configuration") or {})
+                             .get("query_string_template"), args.query_string_template, findings)
     ps = _product_set_from_args(args)
     if ps is not None:
         body["product_set"] = ps

@@ -20,6 +20,7 @@ from decimal import Decimal
 
 from oaiads import api, lint
 from oaiads.commands.common import ARCHIVABLE_STATUSES  # noqa: F401  (kept for symmetry with state_change)
+from oaiads.commands.campaigns import PLATFORMS
 from oaiads.commands.common import money_flag, parse_time_to_unix
 from oaiads.commands.files import upload_image
 from oaiads.formatting import _die, _err, _output_json, amount_to_micros, fmt_money
@@ -123,6 +124,9 @@ def _campaign_body(c: dict, findings: list) -> dict | None:
         if c.get("exclude_audience_ids"):
             t["excluded_custom_audiences"] = {"ids": list(c["exclude_audience_ids"])}
         if c.get("platforms"):
+            bad = [p for p in c["platforms"] if p not in PLATFORMS]
+            if bad:
+                findings.append(("error", f"campaign.platforms: unknown {bad}; use {PLATFORMS}."))
             t["platforms"] = {"included": list(c["platforms"])}
         if t:
             body["targeting"] = t
@@ -393,11 +397,13 @@ def cmd_plan_apply(args) -> None:
         groups.append({"key": key, "body": gbody, "ads": ads})
     if not groups:
         findings.append(("error", "plan has no ad_groups."))
-    if campaign_body and (campaign_body.get("landing_page_configuration") or {}).get("query_string_template") and \
-            any((g["body"].get("landing_page_configuration") or {}).get("query_string_template") for g in groups):
-        findings.append(("warn", "query_string_template on the campaign AND on ad groups — precedence is unverified and the "
-                                 "ad-group template may replace the campaign one entirely (utm_source/medium/campaign lost). "
-                                 "Put the FULL UTM set on each ad group and drop the campaign template."))
+    camp_tpl = (campaign_body or {}).get("landing_page_configuration") or {}
+    if camp_tpl.get("query_string_template"):
+        dup = sorted({k for g in groups for k in lint.utm_overlap(
+            camp_tpl["query_string_template"], (g["body"].get("landing_page_configuration") or {}).get("query_string_template"))})
+        if dup:
+            findings.append(("warn", f"UTM key(s) {dup} set on the campaign AND on ad groups — the ad-group value wins for those "
+                                     f"keys (templates combine; precedence {lint.UTM_PRECEDENCE})."))
 
     n_ads = sum(len(g["ads"]) for g in groups)
     n_existing = (1 if state["created"].get("campaign") else 0) + \

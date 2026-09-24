@@ -12,9 +12,9 @@ import sys
 from oaiads import __version__, api
 from oaiads.commands.account import (
     cmd_account, cmd_account_activate, cmd_account_pause, cmd_accounts, cmd_api_key_create, cmd_api_limits,
-    cmd_brand_update, cmd_landing_check, cmd_negative_keywords, cmd_negative_keywords_add,
-    cmd_negative_keywords_remove, cmd_negative_keywords_set, cmd_spend_limit_create, cmd_spend_limit_delete,
-    cmd_spend_limit_update, cmd_spend_limits,
+    cmd_brand_update, cmd_daily_spend_limit_delete, cmd_daily_spend_limit_set, cmd_landing_check, cmd_negative_keywords,
+    cmd_negative_keywords_add, cmd_negative_keywords_remove, cmd_negative_keywords_set, cmd_spend_limit_create,
+    cmd_spend_limit_delete, cmd_spend_limit_update, cmd_spend_limits,
 )
 from oaiads.commands.adgroups import (
     BILLING_EVENTS, STRATEGIES, cmd_adgroup_activate, cmd_adgroup_archive, cmd_adgroup_create, cmd_adgroup_detail,
@@ -30,11 +30,12 @@ from oaiads.commands.agents import (
 )
 from oaiads.commands.audiences import (
     IDENTIFIER_TYPES, INTENDED_USES, cmd_audience_add, cmd_audience_archive, cmd_audience_create, cmd_audience_detail,
-    cmd_audience_merge, cmd_audience_operation, cmd_audience_remove, cmd_audience_replace, cmd_audiences,
+    cmd_audience_merge, cmd_audience_operation, cmd_audience_operation_cancel, cmd_audience_operation_resume,
+    cmd_audience_operations, cmd_audience_remove, cmd_audience_replace, cmd_audiences,
 )
 from oaiads.commands.bulk import cmd_bulk_job, cmd_bulk_operations, cmd_bulk_submit
 from oaiads.commands.campaigns import (
-    BIDDING_TYPES, MODES, OBJECTIVES, cmd_campaign_activate, cmd_campaign_archive, cmd_campaign_create,
+    BIDDING_TYPES, MODES, OBJECTIVES, PLATFORMS, cmd_campaign_activate, cmd_campaign_archive, cmd_campaign_create,
     cmd_campaign_detail, cmd_campaign_pause, cmd_campaign_update, cmd_campaigns,
 )
 from oaiads.commands.common import STATUS_CREATE, STATUS_UPDATE
@@ -98,8 +99,28 @@ def _print_banner() -> None:
     print()
 
 
-def _cmd(sub, name: str, func, help_: str, *, write: bool = False):
+# Endpoints that left the public OpenAPI spec (checked 2026-09-24): negative keywords, lead forms, Business
+# Agents. They never worked on self-serve accounts (404/403). The commands stay for accounts OpenAI enabled
+# them for, print a stderr notice and are slated for removal in the next major version.
+DEPRECATED_NOTE = "removed from the public OpenAPI spec (2026-09); works only if OpenAI enabled it for the account"
+
+
+def _deprecated(func, name: str):
+    def wrapper(args):
+        _err_deprecated(name)
+        return func(args)
+    return wrapper
+
+
+def _err_deprecated(name: str) -> None:
+    print(f"⚠ {name}: {DEPRECATED_NOTE} — expect 403/404; slated for removal in 2.0.", file=sys.stderr)
+
+
+def _cmd(sub, name: str, func, help_: str, *, write: bool = False, deprecated: bool = False):
     """Add a subcommand; writes get --confirm (default = dry-run) and --idempotency-key."""
+    if deprecated:
+        func = _deprecated(func, name)
+        help_ = f"[DEPRECATED] {help_}"
     sp = sub.add_parser(name, help=help_ + (" [write]" if write else ""))
     if write:
         sp.add_argument("--confirm", action="store_true", help="Actually send the write (default: dry-run plan only)")
@@ -129,7 +150,9 @@ def _targeting_args(sp) -> None:
     sp.add_argument("--exclude-location-ids", help="Excluded location ids")
     sp.add_argument("--audience-ids", help="Custom audience ids to INCLUDE (needs ~25k matched users; not EEA/CH)")
     sp.add_argument("--exclude-audience-ids", help="Custom audience ids to EXCLUDE (small audiences OK)")
-    sp.add_argument("--platforms", help="Comma: web,ios_app,android_app (default all)")
+    sp.add_argument("--platforms", help=f"Comma: {','.join(PLATFORMS)} (default all; 'web' = every web platform, "
+                                        "desktop_web/ios_web/android_web = one browser platform)")
+    sp.add_argument("--clear-platforms", action="store_true", help="targeting.platforms=null (remove only the platform restriction)")
     sp.add_argument("--targeting-json", help="Raw TargetingParams JSON (or @file) — overrides the flags above")
 
 
@@ -204,23 +227,34 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     # ----- Account ---------------------------------------------------------
-    _cmd(sub, "account", cmd_account, "Ad account: status, review, currency, tz, negative keywords, spend caps")
+    _cmd(sub, "account", cmd_account, "Ad account: status, reviews, currency, tz, origin country, spend caps")
     sp = _cmd(sub, "accounts", cmd_accounts, "List ad accounts reachable with this key")
     sp.add_argument("--max-items", type=int, default=api.LIST_HARD_CAP)
     sp = _cmd(sub, "brand-update", cmd_brand_update, "Update account name / URL / favicon (starts brand review)", write=True)
     sp.add_argument("--name")
     sp.add_argument("--url")
     sp.add_argument("--favicon-file-id", help="file_id from image-upload --purpose account_favicon")
-    _cmd(sub, "negative-keywords", cmd_negative_keywords, "Show account-level negative keywords")
-    sp = _cmd(sub, "negative-keywords-set", cmd_negative_keywords_set, "REPLACE the negative keyword list (max 100)", write=True)
+    _cmd(sub, "negative-keywords", cmd_negative_keywords, "Show account-level negative keywords", deprecated=True)
+    sp = _cmd(sub, "negative-keywords-set", cmd_negative_keywords_set, "REPLACE the negative keyword list (max 100)",
+              write=True, deprecated=True)
     sp.add_argument("--keywords", help="Comma-separated")
     sp.add_argument("--keywords-file", help="One keyword per line")
-    sp = _cmd(sub, "negative-keywords-add", cmd_negative_keywords_add, "Add negative keywords (read-modify-write)", write=True)
+    sp = _cmd(sub, "negative-keywords-add", cmd_negative_keywords_add, "Add negative keywords (read-modify-write)",
+              write=True, deprecated=True)
     sp.add_argument("--keywords", required=True)
-    sp = _cmd(sub, "negative-keywords-remove", cmd_negative_keywords_remove, "Remove negative keywords", write=True)
+    sp = _cmd(sub, "negative-keywords-remove", cmd_negative_keywords_remove, "Remove negative keywords", write=True, deprecated=True)
     sp.add_argument("--keywords", required=True)
-    _cmd(sub, "spend-limits", cmd_spend_limits, "List account spend limit windows (the spend fuse)")
-    sp = _cmd(sub, "spend-limit-create", cmd_spend_limit_create, "Create a spend limit window", write=True)
+    _cmd(sub, "spend-limits", cmd_spend_limits, "Account spending limits: daily limit + date-range windows (the spend fuse)")
+    sp = _cmd(sub, "daily-spend-limit-set", cmd_daily_spend_limit_set,
+              "Create/edit the DAILY account spending limit (renews at midnight, account tz)", write=True)
+    sp.add_argument("--amount", required=True, help="Allowance per day in account currency (required even when only the end changes)")
+    sp.add_argument("--start", help="YYYY-MM-DD, NEW limit only (tomorrow or later; default earliest_daily_start_date). Omit when editing")
+    sp.add_argument("--end", help="YYYY-MM-DD EXCLUSIVE end (omit = keep the current end)")
+    sp.add_argument("--no-end", action="store_true", help="end_date=null (repeat until removed)")
+    sp.add_argument("--expected-revision", help="`revision` from spend-limits (default: read now)")
+    sp = _cmd(sub, "daily-spend-limit-delete", cmd_daily_spend_limit_delete, "Remove the daily account spending limit", write=True)
+    sp.add_argument("--expected-revision", help="`revision` from spend-limits (default: read now)")
+    sp = _cmd(sub, "spend-limit-create", cmd_spend_limit_create, "Create a date-range spend limit window", write=True)
     sp.add_argument("--start", required=True, help="YYYY-MM-DD inclusive")
     sp.add_argument("--end", required=True, help="YYYY-MM-DD EXCLUSIVE")
     sp.add_argument("--amount", required=True, help="Cap in account currency")
@@ -275,8 +309,9 @@ def build_parser() -> argparse.ArgumentParser:
     # ----- Ad groups -------------------------------------------------------
     sp = _cmd(sub, "adgroups", cmd_adgroups, "List ad groups (optionally by campaign)")
     sp.add_argument("--campaign-id")
+    sp.add_argument("--bid-check", action="store_true", help="include[]=bid_too_low — OpenAI's low-bid guidance per ad group")
     _list_args(sp)
-    sp = _cmd(sub, "adgroup-detail", cmd_adgroup_detail, "Ad group detail incl. bidding, hints, issues")
+    sp = _cmd(sub, "adgroup-detail", cmd_adgroup_detail, "Ad group detail incl. bidding, hints, issues, bid_too_low")
     sp.add_argument("--ad-group-id", "--adgroup-id", required=True)
     sp.add_argument("--with-children", action="store_true", help="Also list its ads")
     sp = _cmd(sub, "adgroup-create", cmd_adgroup_create, "Create an ad group (paused)", write=True)
@@ -411,6 +446,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--operation-id", required=True)
     sp.add_argument("--wait", action="store_true")
     sp.add_argument("--wait-timeout", type=int, default=600)
+    sp = _cmd(sub, "audience-operations", cmd_audience_operations, "List retained membership operations of an audience")
+    sp.add_argument("--audience-id", required=True)
+    sp.add_argument("--limit", type=int, default=100, help="Page size 1–100 (paging is automatic)")
+    sp.add_argument("--max-items", type=int, default=api.LIST_HARD_CAP)
+    for action, fn, what in (("resume", cmd_audience_operation_resume, "Resume an interrupted add/remove (409 recovery_required)"),
+                             ("cancel", cmd_audience_operation_cancel, "Cancel an add/remove before it applies")):
+        sp = _cmd(sub, f"audience-operation-{action}", fn, what, write=True)
+        sp.add_argument("--audience-id", required=True)
+        sp.add_argument("--operation-id", required=True)
 
     # ----- Conversions -----------------------------------------------------
     sp = _cmd(sub, "pixels", cmd_pixels, "List conversion sources (pixels)")
@@ -473,27 +517,27 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--feed-id", required=True)
 
     # ----- Lead forms & lead sync -----------------------------------------
-    sp = _cmd(sub, "lead-forms", cmd_lead_forms, "List lead forms")
+    sp = _cmd(sub, "lead-forms", cmd_lead_forms, "List lead forms", deprecated=True)
     sp.add_argument("--all", action="store_true")
-    sp = _cmd(sub, "lead-form-detail", cmd_lead_form_detail, "Lead form detail (optionally a revision)")
+    sp = _cmd(sub, "lead-form-detail", cmd_lead_form_detail, "Lead form detail (optionally a revision)", deprecated=True)
     sp.add_argument("--lead-form-id", required=True)
     sp.add_argument("--rev-id")
-    sp = _cmd(sub, "lead-form-create", cmd_lead_form_create, "Create a lead form DRAFT (3–5 fields)", write=True)
+    sp = _cmd(sub, "lead-form-create", cmd_lead_form_create, "Create a lead form DRAFT (3–5 fields)", write=True, deprecated=True)
     sp.add_argument("--name", required=True)
     sp.add_argument("--privacy-url")
     sp.add_argument("--fields-json", required=True, help='JSON (or @file): [{"field_type":"text","label":"E-mail","required":true}, …]')
-    sp = _cmd(sub, "lead-form-update", cmd_lead_form_update, "Save a new draft revision", write=True)
+    sp = _cmd(sub, "lead-form-update", cmd_lead_form_update, "Save a new draft revision", write=True, deprecated=True)
     sp.add_argument("--lead-form-id", required=True)
     sp.add_argument("--name")
     sp.add_argument("--privacy-url")
     sp.add_argument("--fields-json")
     sp.add_argument("--expected-draft-revision-id")
-    sp = _cmd(sub, "lead-form-publish", cmd_lead_form_publish, "Publish the current draft", write=True)
+    sp = _cmd(sub, "lead-form-publish", cmd_lead_form_publish, "Publish the current draft", write=True, deprecated=True)
     sp.add_argument("--lead-form-id", required=True)
     sp.add_argument("--expected-draft-revision-id")
-    sp = _cmd(sub, "lead-form-archive", cmd_lead_form_archive, "Archive a lead form", write=True)
+    sp = _cmd(sub, "lead-form-archive", cmd_lead_form_archive, "Archive a lead form", write=True, deprecated=True)
     sp.add_argument("--lead-form-id", required=True)
-    sp = _cmd(sub, "lead-form-test", cmd_lead_form_test, "Send a synthetic signed test lead to the webhook", write=True)
+    sp = _cmd(sub, "lead-form-test", cmd_lead_form_test, "Send a synthetic signed test lead to the webhook", write=True, deprecated=True)
     sp.add_argument("--lead-form-id", required=True)
     sp.add_argument("--expected-published-revision-id")
     sp = _cmd(sub, "lead-syncs", cmd_lead_syncs, "List lead-sync webhook subscriptions")
@@ -508,12 +552,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--subscription-id", required=True)
 
     # ----- Business agents -------------------------------------------------
-    _cmd(sub, "business-agents", cmd_business_agents, "List Business Agents (branded chat agents)")
-    sp = _cmd(sub, "business-agent-detail", cmd_business_agent_detail, "Business Agent detail")
+    _cmd(sub, "business-agents", cmd_business_agents, "List Business Agents (branded chat agents)", deprecated=True)
+    sp = _cmd(sub, "business-agent-detail", cmd_business_agent_detail, "Business Agent detail", deprecated=True)
     sp.add_argument("--business-agent-id", required=True)
-    _cmd(sub, "business-agent-tools", cmd_business_agent_tools, "Tools installable into a Business Agent")
+    _cmd(sub, "business-agent-tools", cmd_business_agent_tools, "Tools installable into a Business Agent", deprecated=True)
     for action, fn in (("create", cmd_business_agent_create), ("update", cmd_business_agent_update)):
-        sp = _cmd(sub, f"business-agent-{action}", fn, f"{action.capitalize()} a Business Agent draft", write=True)
+        sp = _cmd(sub, f"business-agent-{action}", fn, f"{action.capitalize()} a Business Agent draft", write=True, deprecated=True)
         if action == "update":
             sp.add_argument("--business-agent-id", required=True)
         sp.add_argument("--name", required=(action == "create"), help="≤ 50 chars")
@@ -527,10 +571,10 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--connector-ids")
         sp.add_argument("--lead-form-id", help="Published lead form id ('' to unlink on update)")
         sp.add_argument("--lead-form-revision-id")
-    sp = _cmd(sub, "business-agent-preview", cmd_business_agent_preview, "Preview a reply from the agent")
+    sp = _cmd(sub, "business-agent-preview", cmd_business_agent_preview, "Preview a reply from the agent", deprecated=True)
     sp.add_argument("--business-agent-id", required=True)
     sp.add_argument("--message", action="append", required=True, help="user:… / assistant:… (repeatable, max 10)")
-    sp = _cmd(sub, "business-agent-publish", cmd_business_agent_publish, "Publish the agent draft", write=True)
+    sp = _cmd(sub, "business-agent-publish", cmd_business_agent_publish, "Publish the agent draft", write=True, deprecated=True)
     sp.add_argument("--business-agent-id", required=True)
 
     # ----- Plan (whole campaign tree from one JSON) -------------------------

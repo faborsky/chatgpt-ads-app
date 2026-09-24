@@ -22,42 +22,42 @@ from oaiads.commands.common import (
 
 def cmd_account(args) -> None:
     acct = api._api_call("GET", "/ad_account")
-    windows = api._api_call("GET", "/ad_account/spend_limit_windows", soft=True)
-    if isinstance(windows, dict) and "_error" not in windows:
-        acct["_spend_limit_windows"] = windows.get("data", windows)
-    elif isinstance(windows, dict):
-        acct["_spend_limit_windows_error"] = windows["_error"]
+    limits = fetch_spend_limits()
+    if "_error" not in limits:
+        acct["_spend_limit_windows"] = limits.get("data") or []
+        acct["_daily_spend_limit"] = limits.get("daily_limit")
+    else:
+        acct["_spend_limit_windows_error"] = limits["_error"]
     api.account_meta(refresh=True)
 
     def human(a):
         review = a.get("review") or {}
         integ = (a.get("account_integrity_review") or {}).get("review") or {}
+        cur = a.get("currency_code")
         print(f"Account:   {a.get('name')} ({a.get('id')})")
         print(f"URL:       {a.get('url')}   favicon: {'yes' if a.get('preview_url') else 'MISSING'}")
-        print(f"Status:    {a.get('status')}   currency: {a.get('currency_code')}   timezone: {a.get('timezone')}")
+        print(f"Status:    {a.get('status')}   currency: {cur}   timezone: {a.get('timezone')}"
+              + (f"   origin country: {a['origin_country_code']}" if a.get("origin_country_code") else ""))
         print(f"Brand review:     {review.get('status')}" + (f" — {review.get('reason')}" if review.get("reason") else ""))
         if integ:
             print(f"Integrity review: {integ.get('status')}" + (f" — {integ.get('reason')}" if integ.get("reason") else ""))
-        if "negative_keywords" in a:
+        if "negative_keywords" in a:  # removed from the public spec 2026-09; shown only if an account still returns it
             nk = a.get("negative_keywords") or []
             print(f"Negative keywords: {len(nk)}" + (f" — {', '.join(nk[:8])}{'…' if len(nk) > 8 else ''}" if nk else ""))
-        else:
-            print("Negative keywords: not available on this account (field absent; POST → 404)")
         wins = a.get("_spend_limit_windows")
         if a.get("_spend_limit_windows_error"):
             e = a["_spend_limit_windows_error"]
-            print(f"Spend limit windows: endpoint unavailable on this account (HTTP {e.get('status')}: {e.get('message')}) — "
-                  "no account-level cap via API; use daily budgets + end dates on campaigns.")
+            print(f"Account spending limits: not readable with this key (HTTP {e.get('status')}: {e.get('message')}) — "
+                  "they need postpaid invoice billing + billing-admin permission; use campaign daily budgets + end dates.")
         if isinstance(wins, list):
-            if not wins:
-                print("Spend limit windows: NONE — consider `spend-limit-create` before automating writes.")
-            else:
-                print("Spend limit windows:")
-                for w in wins:
-                    print(f"  {w.get('window_id')}  {w.get('start_date')} → {w.get('end_date')}  "
-                          f"{fmt_money(w.get('amount_micros'), a.get('currency_code'))}  spent "
-                          f"{fmt_money(w.get('spent_micros'), a.get('currency_code'))}  [{w.get('status')}]"
-                          + (f"  {w.get('name')}" if w.get("name") else ""))
+            print(f"Daily account limit: {fmt_daily_limit(a.get('_daily_spend_limit'), cur)}")
+            if not wins and not a.get("_daily_spend_limit"):
+                print("Date-range limits: NONE — consider daily-spend-limit-set / spend-limit-create before automating writes.")
+            for w in wins:
+                print(f"  {w.get('window_id')}  {w.get('start_date')} → {w.get('end_date')}  "
+                      f"{fmt_money(w.get('amount_micros'), cur)}  spent "
+                      f"{fmt_money(w.get('spent_micros'), cur)}  [{w.get('status')}]"
+                      + (f"  {w.get('name')}" if w.get("name") else ""))
         if review.get("status") != "approved":
             _err("⚠ Account brand review is not approved — the account cannot serve ads until it is.")
 
@@ -185,37 +185,69 @@ def cmd_negative_keywords_remove(args) -> None:
 # spend limit windows — the account-level safety fuse
 # ---------------------------------------------------------------------------
 
-SPEND_LIMIT_FALLBACK = ("Spend limit windows are not available on this account (the endpoint answers 404 'Invalid URL' — "
-                        "it is in the OpenAPI spec but not deployed for self-serve accounts as of 2026-09-02). Fallback fuse: "
-                        "campaign daily budgets (spend can reach 2× on a day) + campaign end_time, and `pulse` to watch spend.")
+SPEND_LIMIT_FALLBACK = ("Account spending limits are not available with this key/account. They need postpaid invoice "
+                        "billing AND permission to manage billing (reads included) — live 2026-09-24 a self-serve API key got "
+                        "403 'Only ad account admins can perform this action' (before 2026-09-09: 404 'Invalid URL'). Fallback "
+                        "fuse: campaign daily budgets (spend can reach 2× on a day) + campaign end_time, and `pulse` to watch spend.")
+
+
+def spend_limits_unavailable(err: dict) -> bool:
+    """404 (not deployed) or 403 (not an admin / not postpaid invoice billing) — both mean 'no account cap via API'."""
+    return err.get("status") in (403, 404)
+
+
+def fetch_spend_limits() -> dict:
+    """GET /ad_account/spend_limit_windows as {data, daily_limit, revision, …}; soft (may carry `_error`)."""
+    data = api._api_call("GET", "/ad_account/spend_limit_windows", soft=True)
+    if isinstance(data, list):  # defensive: older shape was a bare list
+        return {"data": data}
+    return data if isinstance(data, dict) else {}
+
+
+def fmt_daily_limit(d: dict | None, cur: str | None) -> str:
+    if not d:
+        return "none"
+    txt = (f"{fmt_money(d.get('amount_micros'), cur)}/day from {d.get('start_date')}"
+           f"{' until ' + str(d.get('end_date')) + ' (excl.)' if d.get('end_date') else ', no end date'} [{d.get('status')}]")
+    if d.get("spent_micros") is not None:
+        txt += f" — today spent {fmt_money(d.get('spent_micros'), cur)}, remaining {fmt_money(d.get('remaining_micros'), cur)}"
+    return txt
 
 
 def cmd_spend_limits(args) -> None:
-    data = api._api_call("GET", "/ad_account/spend_limit_windows", soft=True)
-    if isinstance(data, dict) and "_error" in data:
+    data = fetch_spend_limits()
+    if "_error" in data:
         e = data["_error"]
-        if e.get("status") == 404:
+        if spend_limits_unavailable(e):
             if args.json:
                 _output_json({"available": False, "error": e, "fallback": SPEND_LIMIT_FALLBACK})
             else:
-                _err(f"⚠ HTTP 404: {e.get('message')}")
+                _err(f"⚠ HTTP {e.get('status')}: {e.get('message')}")
                 print(SPEND_LIMIT_FALLBACK)
             return
         _die(f"ERROR: HTTP {e.get('status')} {e.get('code') or ''}: {e.get('message')}")
-    rows = data.get("data", data) if isinstance(data, dict) else data
     cur = api.account_currency()
 
-    def human(items):
+    def human(d):
+        items = d.get("data") or []
+        print(f"Daily limit: {fmt_daily_limit(d.get('daily_limit'), cur)}")
+        if d.get("daily_limit") is None:
+            print(f"  can create: {'yes' if d.get('can_create_daily_limit') else 'no'}"
+                  + (f", earliest start {d.get('earliest_daily_start_date')}" if d.get("earliest_daily_start_date") else "")
+                  + " — daily-spend-limit-set")
+        print(f"Revision: {d.get('revision', 0)} (expected_revision for daily-limit changes)"
+              + (f"; date-range limits may start from {d['earliest_dated_start_date']}" if d.get("earliest_dated_start_date") else ""))
         if not items:
-            print("No spend limit windows. Create one with spend-limit-create (start inclusive, end exclusive).")
+            print("Date-range limits: none (spend-limit-create; start inclusive, end exclusive).")
             return
+        print("Date-range limits:")
         print_table([[w.get("window_id"), w.get("start_date"), w.get("end_date"), fmt_money(w.get("amount_micros"), cur),
                       fmt_money(w.get("spent_micros"), cur), w.get("status"), w.get("name") or "",
                       "yes" if w.get("can_edit") else "no", "yes" if w.get("can_delete") else "no"]
                      for w in items],
                     ["Window", "Start", "End (excl.)", "Limit", "Spent", "Status", "Name", "Editable", "Deletable"])
 
-    emit(rows, args, human)
+    emit(data, args, human)
 
 
 def _window_body(args, create: bool) -> dict:
@@ -260,6 +292,52 @@ def cmd_spend_limit_delete(args) -> None:
     run_write("POST", f"/ad_account/spend_limit_windows/{args.window_id}/delete", None, args,
               f"Spend limit window {args.window_id} deleted — the account has one fewer spend cap.",
               idempotent=True, note="Removes a spend cap. Make sure another guard exists.")
+
+
+# ---------------------------------------------------------------------------
+# daily account spending limit (2026-09-09) — renews at midnight in the account timezone
+# ---------------------------------------------------------------------------
+
+def _current_revision(args) -> int:
+    """expected_revision: the flag, else the `revision` of a fresh list read (0 when the field is absent)."""
+    if args.expected_revision is not None:
+        return int(args.expected_revision)
+    data = fetch_spend_limits()
+    if "_error" in data:
+        e = data["_error"]
+        _die(f"ERROR: cannot read the current spending-limit revision — HTTP {e.get('status')}: {e.get('message')}"
+             + (f"\n  {SPEND_LIMIT_FALLBACK}" if spend_limits_unavailable(e) else ""))
+    return int(data.get("revision") or 0)
+
+
+DAILY_MUTATION_NOTE = ("Daily-limit writes are guarded by expected_revision: 409 = stale revision (re-read with spend-limits); "
+                       "503 = the change may have landed — re-read before retrying (never auto-retried).")
+
+
+def cmd_daily_spend_limit_set(args) -> None:
+    body: dict = {"amount_micros": money_flag(args.amount, "--amount", minimum_micros=0),
+                  "expected_revision": _current_revision(args)}
+    if args.start:
+        body["start_date"] = parse_iso_date(args.start, "--start").isoformat()
+        if body["start_date"] <= date.today().isoformat():
+            _err("⚠ a NEW daily limit starts tomorrow at the earliest (earliest_daily_start_date in spend-limits).")
+    if args.no_end:
+        body["end_date"] = None
+    elif args.end:
+        body["end_date"] = parse_iso_date(args.end, "--end").isoformat()
+        if body.get("start_date") and body["end_date"] <= body["start_date"]:
+            _die("ERROR: --end must be after --start (end date is exclusive).")
+    run_write("POST", "/ad_account/daily_spend_limit", body, args,
+              lambda: f"Daily spending limit saved: {fmt_money(body['amount_micros'], api.account_currency())}/day.",
+              note=DAILY_MUTATION_NOTE + " Omit --start when editing (an existing start date cannot change); "
+                                         "--no-end clears the end date.")
+
+
+def cmd_daily_spend_limit_delete(args) -> None:
+    body = {"expected_revision": _current_revision(args)}
+    run_write("POST", "/ad_account/daily_spend_limit/delete", body, args,
+              "Daily spending limit removed — the account has one fewer spend cap.",
+              note="Removes the daily account cap (date-range limits stay). " + DAILY_MUTATION_NOTE)
 
 
 # ---------------------------------------------------------------------------

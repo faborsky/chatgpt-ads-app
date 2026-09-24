@@ -337,7 +337,7 @@ def test_pulse_survives_partial_failures(fake_api, capsys):
     answers["GET /campaigns"] = {"data": [{"id": "c1", "name": "A", "status": "active", "conversion_event_setting_ids": []}]}
     run(["pulse"])
     out = capsys.readouterr().out
-    assert "PULSE" in out and "Spend" in out and "NONE active" in out and "conversions: HTTP 403" in out
+    assert "PULSE" in out and "Spend" in out and "account spending limits: NONE" in out and "conversions: HTTP 403" in out
     assert "no conversion event linked" in out
 
 
@@ -477,7 +477,7 @@ def test_pulse_warns_on_foreign_country_targeting(fake_api, capsys):
                                           "targeting": {"locations": {"include": [{"id": "1000232", "type": "country", "country_code": "US"}]}}}]}
     run(["pulse"])
     out = capsys.readouterr().out
-    assert "targets ['US']" in out and "endpoint unavailable" in out
+    assert "targets ['US']" in out and "not readable" in out
 
 
 # ---------------------------------------------------------------------------
@@ -715,22 +715,27 @@ def test_adgroup_id_alias(fake_api, capsys):
     assert args.ad_group_id == "adgrp_2"
 
 
-def test_adgroup_create_warns_on_double_utm_template(fake_api, capsys):
-    """#6: precedence campaign vs ad-group template is unverified — warn when both are set."""
+def test_adgroup_create_utm_levels_combine_warn_only_on_duplicate_keys(fake_api, capsys):
+    """Docs 2026-09: templates on campaign/ad group/ad COMBINE; a duplicate key is taken from the more specific level."""
     _, answers = fake_api
     answers["GET /campaigns/cmpn_1"] = {"id": "cmpn_1", "bidding_type": "clicks",
-                                        "landing_page_configuration": {"query_string_template": "utm_source=chatgpt"}}
+                                        "landing_page_configuration": {"query_string_template": "utm_source=chatgpt&utm_content=x"}}
+    run(["adgroup-create", "--campaign-id", "cmpn_1", "--name", "Group A", "--max-bid", "1",
+         "--query-string-template", "utm_medium=cpc"])
+    assert "UTM key" not in capsys.readouterr().err          # disjoint keys simply combine
     run(["adgroup-create", "--campaign-id", "cmpn_1", "--name", "Group A", "--max-bid", "1",
          "--query-string-template", "utm_content=A"])
-    assert "precedence is unverified" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "['utm_content']" in err and "ad group value wins" in err
 
 
 def test_plan_apply_warns_on_campaign_and_adgroup_templates(fake_api, tmp_path, capsys):
     p = _write_plan(tmp_path, campaign={"name": "Podzim", "bidding_type": "clicks", "daily_budget": 15, "end": "2099-01-01",
                                         "location_ids": ["1000055"], "conversion_event_setting_ids": ["ces_1"],
-                                        "query_string_template": "utm_source=chatgpt&utm_medium=cpc"})
+                                        "query_string_template": "utm_source=chatgpt&utm_content=campaign"})
     run(["plan-apply", "--file", str(p)])
-    assert "Put the FULL UTM set on each ad group" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "['utm_content']" in err and "ad-group value wins" in err
 
 
 def _live_tree(answers, hints_a, title_a0="Kurz práce s AI", file_id="file_9"):

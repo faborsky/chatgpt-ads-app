@@ -2,6 +2,38 @@
 
 Všechny podstatné změny v tomto projektu. Formát vychází z [Keep a Changelog](https://keepachangelog.com/), verzování je [SemVer](https://semver.org/) (verze žije v `oaiads/__init__.py`).
 
+## [1.5.0] — 2026-09-24 — Srovnání s API po 2026-09-02 🆕
+
+Nové porovnání appky s API: changelog OpenAI (9. a 10. září), celé docs znovu přečtené (`llms-full.txt`), aktuální OpenAPI spec strojově porovnaná s tím, co CLI posílá (verze spec je pořád 2.3.0, obsah ale jiný: 78 operací místo 88), čtení ověřené živě na dvou self-serve účtech. Detail v `docs/api-notes.md → Změny API 2026-09`.
+
+### Přidáno
+- **Denní limit útraty účtu** (API 2026-09-09): `daily-spend-limit-set` (`--amount`, `--start` jen u nového, `--end` / `--no-end`, `--expected-revision`, jinak si ho CLI načte) a `daily-spend-limit-delete`. Zápisy nejsou automaticky opakované (503 = změna možná prošla → znovu načíst). `spend-limits` ukazuje denní limit (dnešní útrata, zbytek), `revision`, `can_create_daily_limit`, nejbližší možné starty; `account` a `pulse` denní limit taky.
+- **Granulární web platformy** (API 2026-09-10): `--platforms` bere `desktop_web`, `ios_web`, `android_web` (a dál `web` = všechny weby, `ios_app`, `android_app`); `--clear-platforms` pošle `targeting.platforms: null` (zruší jen omezení platforem). Prázdný seznam CLI odmítne (API vrací 400), `web` + konkrétní web platforma = varování na redundanci. Validace i v `plan-apply`.
+- **`insights --segment platform`**: výkon po platformách (ověřeno živě; metriky chodí jako ploché klíče `clicks`/`spend`).
+- **`bid_too_low`** (docs 2026-09, ve spec zatím chybí, živě funguje na detailu i výpisu): `adgroup-detail` ho vždy načte a ukáže, `adgroups --bid-check` přidá sloupec a souhrn, `pulse` hlásí počet aktivních sestav s tímto varováním.
+- **Audience operace**: `audience-operations` (výpis uchovaných operací, stránkování přes `next_cursor` i přes prázdné stránky), `audience-operation-resume` a `audience-operation-cancel` (bez těla a bez `Idempotency-Key`, podle docs). `audience-operation` při `409 custom_audience_operation_recovery_required` rovnou poradí resume a `503 …unavailable` při `--wait` bere jako „zkus znovu“, ne jako selhání.
+- Insights: varování, když okno sahá za retenci (hodinová data ~30 dní, produktová ~30 dní, ostatní 365 dní).
+- Produktové filtry: `ads_metadata.<klíč>` (vlastní štítky) bez varování „neznámé pole“.
+
+### Změněno
+- **Maximize Results podle nových docs**: `--strategy maximize_clicks|maximize_conversions` bez `--max-bid`; CLI kontroluje odpovídající cíl kampaně (clicks / conversions), click billing a **denní** budget; při přepnutí na Maximize zahodí `max_bid_micros` a vyprázdní audience multiplikátory, zpět na `fixed_bid` chce explicitní bid.
+- **Budget je vždy jeden**: `--daily-budget` a `--lifetime-budget` zároveň = chyba (i v `plan-apply`); `campaign-update` odmítne přepnout denní budget na celkový (API to neumí, jen celkový → denní).
+- **UTM šablony**: OpenAI zdokumentovalo, že šablony na účtu, kampani, sestavě a reklamě se **sčítají** a u duplicitního klíče vyhrává konkrétnější úroveň (URL > reklama > sestava > kampaň > účet). Varování „precedence neověřená, sestavová může kampaňovou celou nahradit“ nahradilo varování jen na duplicitní klíče (`adgroup-create`, `adgroup-update`, `plan-apply`).
+- `campaign-update` se samotnými platformami pošle jen `targeting.platforms` (API zbytek zachová) a nečte ani neposílá zpět lokace a audiences (odpadá riziko `409 custom_audience_mutation_conflict`).
+- Limity útraty: 403 „Only ad account admins can perform this action“ (tak odpovídá self-serve klíč od 2026-09-09, dřív 404) CLI bere stejně jako 404: pojistka přes API není dostupná, `spend-limits` / `account` / `pulse` nepadají.
+- `pulse` pozná domovskou zemi z nového pole účtu `origin_country_code` (timezone jen jako záloha); stav okna `upcoming` (dřív chybně `scheduled`).
+
+### Opraveno
+- **`campaign_ended` byl „problém“**: reklamy skončené kampaně (serving issue `campaign_ended`) hlásil `pulse` i `ad-review` jako chybu. Živě to byla většina hlášených „problémů“. Teď je to očekávaný stav jako pauza.
+- **Segmentované insights vypadaly zdvojeně**: řádek je kampaň × segment, ale tabulka ukazovala jen segment. Přidán sloupec s entitou (platí i pro country/device/product).
+
+### Deprecated
+- Endpointy, které OpenAI stáhlo z veřejné specifikace: **negativní klíčová slova** (`negative-keywords*`), **lead formuláře** (`lead-form*`) a **Business Agents** (`business-agent*`), celkem 18 příkazů. Na self-serve účtech nikdy nefungovaly (404/403). Zůstávají pro účty, kterým je OpenAI zapnulo, na stderr upozorní a ve 2.0 odejdou. Lead sync (`lead-sync*`) ve specifikaci zůstal. `campaign-create --mode business_agent` varuje.
+
+### Dokumentace
+- api-notes: nová sekce „Změny API 2026-09“ (co přibylo, co zmizelo, co je nově zdokumentované, co jsme ověřili živě); vyřešené body z „Neověřeno živě“ (wire klíče metrik, precedence UTM).
+- Skill a playbook: limity útraty, platformy, Maximize Results, `bid_too_low`, UTM, audience operace, Conversions API novinky (`integration_source`, `validate_only`, offline `action_source`), image tag, `measureSingle`.
+
 ## [1.4.1] — 2026-09-07 — Druhá dávka nálezů (kampaň o stovkách objektů) 🔧
 
 Z nasazení kampaně se stovkami sestav a reklam přes `plan-apply` ve v1.4.0. Detail v `docs/api-notes.md → Poznámky z ostrého provozu → 2026-09-07, druhá dávka`.

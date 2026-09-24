@@ -267,7 +267,10 @@ def issues_str(obj: dict) -> str:
 # still in review. ad-review and pulse must not count them as problems (false alarms seen live
 # 2026-09-04/07: `ad_group_not_active` on a deliberately paused ad group, `ad_in_review` minutes
 # after ad-create).
-PAUSED_CODES = frozenset({"campaign_not_active", "ad_group_not_active", "ad_not_active", "campaign_not_started"})
+# `campaign_ended` (campaign past its end_time) seen live 2026-09-24 on ads of a finished campaign — an intended
+# end state, not a fault.
+PAUSED_CODES = frozenset({"campaign_not_active", "ad_group_not_active", "ad_not_active", "campaign_not_started",
+                          "campaign_ended"})
 REVIEW_CODES = frozenset({"ad_in_review"})
 EXPECTED_ISSUE_CODES = PAUSED_CODES | REVIEW_CODES
 
