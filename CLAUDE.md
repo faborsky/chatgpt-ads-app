@@ -1,6 +1,6 @@
 # ChatGPT Ads App — CLI for the OpenAI Advertiser API (ChatGPT Ads)
 
-Python CLI for ads in ChatGPT via the **OpenAI Advertiser API v1** (`https://api.ads.openai.com/v1`, OpenAPI spec 2.3.0). Version 1.5.0, 101 commands covering all 78 operations of the current spec (re-checked 2026-09-24) + the Bulk API (limited preview) + a `raw` escape hatch; 18 commands target endpoints OpenAI removed from the spec (negative keywords, lead forms, Business Agents) and are deprecated (stderr notice, removal in 2.0). Czech user docs in [README.md](README.md).
+Python CLI for ads in ChatGPT via the **OpenAI Advertiser API v1** (`https://api.ads.openai.com/v1`, OpenAPI spec 2.3.0). Version 1.5.0, 101 commands covering all 78 operations of the current spec (re-checked 2026-09-24) + the Bulk API (limited preview) + a `raw` escape hatch; 18 commands target endpoints OpenAI removed from the spec (negative keywords, lead forms, Business Agents) and are deprecated (stderr notice, removal in 2.0). User docs in [README.md](README.md) (English) and [README.cs.md](README.cs.md) (Czech).
 
 ## Current phase (2026-09-24)
 
@@ -60,7 +60,7 @@ Full flags: README.md command tables, or `--help` per command.
 - **Creates carry an `Idempotency-Key`** (auto-generated, printed) → transient failures are retried safely; writes without one are never auto-retried (the CLI says the write may have landed).
 - **Account spending limits** — daily (`daily-spend-limit-set`, renews at midnight, guarded by `expected_revision`, never auto-retried: 503 = may have landed) or date-range windows (`spend-limit-create`) — are the account-level fuse where available: postpaid invoice billing + a key with billing permission. A self-serve key gets 403 (CLI treats 403/404 as "no account cap via API"), so the fuse is campaign daily budgets (spend can hit 2×/day) + `end_time`, watched via `pulse`.
 - Preflight lint blocks spec violations and warns on ad-policy risks (categories, superlatives, ChatGPT/OpenAI mentions, caps/emoji) and on copy above the Help-Center recommendation (~16-char title, ~32-char body). `landing-check` tests reachability for browser AND bot UA (WAF), robots.txt for **OAI-AdsBot**/OAI-SearchBot, favicon and whether `?oppref=` survives redirects — the top rejection and attribution-loss causes.
-- Listings hide `archived` rows by default. Always use `--json` when parsing programmatically (errors → stderr, stdout stays empty); listings/insights return a **bare JSON array**, details/`pulse` an object (README → Použití). `--ad-group-id` has the alias `--adgroup-id`; listings take `--limit N` (client-side cap).
+- Listings hide `archived` rows by default. Always use `--json` when parsing programmatically (errors → stderr, stdout stays empty); listings/insights return a **bare JSON array**, details/`pulse` an object (README → Usage conventions). `--ad-group-id` has the alias `--adgroup-id`; listings take `--limit N` (client-side cap).
 - **Details are eventually consistent too** (seen live: pause → immediate re-read still `active`). `run_write` re-reads up to 3× (1.5 s apart) and prints "Verified via detail" only on a match, else "still shows the OLD state" — never retry a write because of that line.
 - `ad-review` and `pulse` treat `campaign_not_active` / `ad_group_not_active` / `ad_not_active` / `campaign_not_started` / `campaign_ended` / `ad_in_review` as intended states, never as problems (false alarms seen live). `pulse` reports ⚠ rejected/real issues, ℹ waiting for review, and "not serving only because paused" separately.
 
@@ -88,7 +88,11 @@ Bump `__version__` in `oaiads/__init__.py` → update README (version line, 🆕
 
 ## Documentation map
 
-- [README.md](README.md) — Czech user docs: setup, access walkthrough, command tables
+- [README.md](README.md) — user docs (English, source of truth): setup, access walkthrough, command tables; [README.cs.md](README.cs.md) = full Czech version
 - [docs/api-notes.md](docs/api-notes.md) — how the Advertiser API behaves (spec + docs research, live-verification TODOs)
 - [CHANGELOG.md](CHANGELOG.md) — Keep a Changelog, SemVer
 - [skill/chatgpt-ads/](skill/chatgpt-ads/) — bundled operator skill (`SKILL.md`, `chatgpt-ads-campaign-playbook.md` = prerequisites gate + how campaigns are meant to be built, `chatgpt-ads-policies.md`); [skill/INSTALL.md](skill/INSTALL.md)
+
+## README languages
+
+`README.md` = English, full, source of truth. `README.cs.md` = full Czech. `i18n/README.<lang>.md` = short versions (es, pt-BR, de, fr, zh-CN, ja, sv, nb, da). A README change updates both full versions in the same commit; `i18n/` only when the quick start, main features or name change. Author links: faborsky.com in EN/i18n, faborsky.cz + aifirst.cz in Czech.
