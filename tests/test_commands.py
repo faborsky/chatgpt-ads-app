@@ -409,6 +409,402 @@ def test_oppref_survives_helper():
     assert not oppref_survives("https://www.example.com/?oppref=other")
 
 
+@pytest.mark.parametrize("suffix, expected", [
+    ("", "?oppref=oaiads-test123"),
+    ("?a=1", "?a=1&oppref=oaiads-test123"),
+    ("#prihlaska", "?oppref=oaiads-test123#prihlaska"),
+    ("?a=1#x", "?a=1&oppref=oaiads-test123#x"),
+])
+def test_oppref_probe_url(suffix, expected):
+    from oaiads.commands.account import oppref_probe_url
+    assert oppref_probe_url("https://example.com/kurz" + suffix) == "https://example.com/kurz" + expected
+    assert oppref_probe_url("https://example.com", "a&b").endswith("?oppref=a%26b")
+
+
+def test_csp_no_policy():
+    from oaiads.commands.account import csp_pixel_findings
+    assert csp_pixel_findings() == ([], [], None)
+
+
+@pytest.mark.parametrize("policy, allowed", [
+    ("default-src 'self'", [False, False, False, False]),
+    ("default-src https://*.openai.com", [True, True, True, True]),
+    ("default-src *.openai.com", [True, True, True, True]),
+    ("default-src https:", [True, True, True, True]),
+    ("default-src *", [True, True, True, True]),
+    ("default-src 'none'", [False, False, False, False]),
+    ("script-src-elem 'none'; script-src *", [False, True, True, True]),
+    ("script-src-elem *; script-src 'none'", [True, True, True, True]),
+    ("default-src 'none'; script-src https://bzrcdn.openai.com; connect-src https://bzr.openai.com https://bzrcdn.openai.com; img-src https://bzr.openai.com", [True, True, True, True]),
+    ("script-src bzrcdn.openai.com/sdk/", [True, True, True, True]),
+    ("script-src http://bzrcdn.openai.com:80/sdk/oaiq.min.js", [True, True, True, True]),
+    ("script-src https://bzrcdn.openai.com:*/sdk/oaiq.min.js", [True, True, True, True]),
+    ("script-src https://bzrcdn.openai.com:8443", [False, True, True, True]),
+    ("script-src https://[invalid", [False, True, True, True]),
+    ("script-src https://user@bzrcdn.openai.com", [False, True, True, True]),
+    ("script-src https://bzrcdn.openai.com/other.js", ["conditional", True, True, True]),
+    ("script-src https://evilbzrcdn.openai.com https://bzrcdn.openai.com.evil.test", [False, True, True, True]),
+    ("script-src 'none'; script-src *", [False, True, True, True]),
+])
+def test_csp_pixel_sources_and_fallback(policy, allowed):
+    from oaiads.commands.account import csp_pixel_findings
+    summary, findings, meta_error = csp_pixel_findings({"Content-Security-Policy": policy}, "<script>oaiq()</script>")
+    assert summary == [{"source": "header", "allowed": dict(zip(
+        ("script", "connect_events", "connect_config", "img"), allowed))}]
+    assert sum(level == "warn" for level, _ in findings) == allowed.count(False)
+    assert meta_error is None
+
+
+def test_csp_multiple_policies_all_must_allow():
+    from oaiads.commands.account import csp_pixel_findings
+    summary, findings, meta_error = csp_pixel_findings({"Content-Security-Policy": "default-src *, default-src 'none', default-src 'self'"}, "<script>oaiq()</script>")
+    assert len(summary) == 3
+    assert all(summary[0]["allowed"].values())
+    assert not any(summary[1]["allowed"].values())
+    assert sum(level == "warn" for level, _ in findings) == 4
+
+
+def test_csp_meta_parsing():
+    from oaiads.commands.account import csp_pixel_findings
+    html = """<head><script>oaiq()</script><META content='script-src &apos;none&apos;' data-x="ignored"
+        HTTP-EQUIV="Content-Security-Policy">
+        <meta http-equiv='content-security-policy' content="img-src 'none'"/>
+        <meta http-equiv="other" content="default-src 'none'"></head>"""
+    summary, findings, meta_error = csp_pixel_findings({"Content-Security-Policy": "default-src *"}, html)
+    assert [s["source"] for s in summary] == ["header", "meta", "meta"]
+    assert summary[1]["allowed"]["script"] is False
+    assert summary[2]["allowed"]["img"] is False
+    assert sum(level == "warn" for level, _ in findings) == 2
+
+
+def test_csp_report_only():
+    from oaiads.commands.account import csp_pixel_findings
+    summary, findings, meta_error = csp_pixel_findings({"Content-Security-Policy-Report-Only": "default-src 'none'"})
+    assert summary[0]["source"] == "report-only"
+    assert not any(summary[0]["allowed"].values())
+    assert not any(level == "warn" for level, _ in findings)
+    assert sum("not enforced" in msg for _, msg in findings) == 4
+
+
+@pytest.mark.parametrize("header", ["Content-Security-Policy", "Content-Security-Policy-Report-Only"])
+def test_csp_strict_dynamic(header):
+    from oaiads.commands.account import csp_pixel_findings
+    summary, findings, meta_error = csp_pixel_findings({header: "default-src 'none'; script-src 'nonce-test' 'strict-dynamic'"})
+    assert summary[0]["allowed"]["script"] == "conditional"
+    assert not any("SDK will not load" in msg for _, msg in findings)
+    assert any(level == "info" and "nonced/hashed" in msg for level, msg in findings)
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+def test_landing_check_csp(monkeypatch, dummy_resp, capsys, json_output):
+    from oaiads.commands import account
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append((url, kwargs))
+        response = dummy_resp(headers={"Content-Type": "text/html", "Content-Security-Policy": "default-src 'none'"},
+                              text='<html><link rel="icon" href="/icon.ico"><script>oaiq()</script></html>')
+        response.url = url
+        return response
+
+    monkeypatch.setattr(account.requests, "get", fake_get)
+    run(["landing-check", "--url", "https://example.com/kurz?a=1#x"] + (["--json"] if json_output else []))
+    captured = capsys.readouterr()
+    if json_output:
+        result = json.loads(captured.out)
+        assert result["checks"]["oppref_survives"] is True
+        assert result["checks"]["csp"][0]["allowed"]["script"] is False
+        assert any(f["level"] == "warn" and "CSP blocks" in f["message"] for f in result["findings"])
+    else:
+        assert "csp:" in captured.out
+        assert "CSP blocks" in captured.err
+        assert "Pixel not found" not in captured.err
+    assert calls[2][0] == "https://example.com/kurz?a=1&oppref=oaiads-test123#x"
+
+
+@pytest.mark.parametrize("clean_status, probe_status, clean_text, probe_text, content_type, expected", [
+    (200, 403, "ok", "denied", "text/html", [("error", "ad clicks always carry ?oppref=")]),
+    (200, 500, "ok", "failed", "text/html", [("error", "ad clicks always carry ?oppref=")]),
+    (200, 200, "ok", "<p>Protected by reCAPTCHA</p>", "text/html", [("warn", "contains captcha/challenge text")]),
+    (200, 200, "ok", "CAPTCHA", "text/html", [("warn", "contains captcha/challenge text")]),
+    (200, 200, "ok", "cf-challenge", "text/html", [("warn", "contains captcha/challenge text")]),
+    (200, 200, "ok", "Just a Moment", "text/html", [("warn", "contains captcha/challenge text")]),
+    (200, 200, "cf-challenge", "cf-challenge", "text/html", []),
+    (500, 500, "failed", "failed", "text/html", []),
+    (200, 200, "ok", "{}", "application/json", [("warn", "oppref probe returns non-HTML")]),
+    (200, 200, "ok", "ok", "text/html", []),
+])
+def test_landing_check_oppref_response(monkeypatch, dummy_resp, capsys, clean_status, probe_status,
+                                     clean_text, probe_text, content_type, expected):
+    from oaiads.commands import account
+
+    def fake_get(url, **kwargs):
+        probe = "oppref=" in url
+        response = dummy_resp(
+            status_code=probe_status if probe else clean_status,
+            headers={"Content-Type": content_type if probe else "text/html"},
+            text='<link rel="icon" href="/icon.ico">' + (probe_text if probe else clean_text))
+        response.url = url
+        return response
+
+    monkeypatch.setattr(account.requests, "get", fake_get)
+    run(["landing-check", "--url", "https://example.com/kurz#x", "--json"])
+    result = json.loads(capsys.readouterr().out)
+    assert result["checks"]["oppref_status"] == probe_status
+    assert result["checks"]["oppref_survives"] is True  # preservation says nothing about usability
+    probe_findings = [f for f in result["findings"] if "oppref probe" in f["message"] or "test request" in f["message"]]
+    assert len(probe_findings) == len(expected)
+    for finding, (level, text) in zip(probe_findings, expected):
+        assert finding["level"] == level
+        assert text in finding["message"]
+        if "test request with" in finding["message"]:
+            assert f"HTTP {probe_status} while the clean URL returned {clean_status}" in finding["message"]
+        if "contains captcha/challenge text" in finding["message"]:
+            assert "open https://example.com/kurz?oppref=oaiads-test123#x in a browser and check" in finding["message"]
+
+
+@pytest.mark.parametrize("policy, capability, expected", [
+    ("DEFAULT-SRC HTTPS:", "script", True),
+    ("default-src HTTP:", "img", True),
+    ("SCRIPT-SRC 'NONE'", "script", False),
+    ("SCRIPT-SRC HTTPS://BZRCDN.OPENAI.COM", "script", True),
+    ("SCRIPT-SRC https://bzrcdn.openai.com:0443", "script", True),
+    ("script-src https://bzrcdn.openai.com/SDK/", "script", "conditional"),
+    ("script-src https://bzrcdn.openai.com/sdk%2F", "script", "conditional"),
+    ("script-src https://bzrcdn.openai.com/%73dk/oaiq.min.js", "script", True),
+    ("script-src 'NONCE-dGVzdA=='", "script", "conditional"),
+    ("script-src 'sha256-AbCd=='", "script", "conditional"),
+    ("script-src 'SHA384-AbCd=='", "script", "conditional"),
+    ("script-src 'sha512-AbCd=='", "script", "conditional"),
+    ("script-src 'nonce-dGVzdA==' https://bzrcdn.openai.com", "script", True),
+    ("script-src 'STRICT-DYNAMIC' https://bzrcdn.openai.com", "script", "conditional"),
+    ("connect-src https://bzr.openai.com/v1/sdk/ https://bzrcdn.openai.com/", "connect_events", True),
+    ("img-src https://bzr.openai.com/v1/sdk/events", "img", True),
+    ("connect-src https://bzrcdn.openai.com/config/", "connect_config", "conditional"),
+    ("connect-src https://bzr.openai.com/other/", "connect_events", "conditional"),
+])
+def test_csp_review_counterexamples(policy, capability, expected):
+    from oaiads.commands.account import csp_pixel_findings
+    html = '<script nonce="dGVzdA==" src="https://bzrcdn.openai.com/sdk/oaiq.min.js"></script>'
+    summary, findings, error = csp_pixel_findings({"Content-Security-Policy": policy}, html)
+    assert error is None
+    assert summary[0]["allowed"][capability] == expected
+    if expected == "conditional":
+        assert any(level == "info" and "conditional" in msg for level, msg in findings)
+        assert not any(level == "warn" and "script-src" in msg for level, msg in findings)
+    if "nonce" in policy.lower() and expected == "conditional":
+        assert any("relies on nonces/hashes" in msg for _, msg in findings)
+    if "/config/" in policy or "/other/" in policy:
+        assert any("path-restricted source, verify the actual request URL" in msg for _, msg in findings)
+
+
+def test_csp_segment_matching_and_self_default_port():
+    from oaiads.commands.account import _csp_path_matches, csp_pixel_findings
+    assert not _csp_path_matches("/sdk%2F", "/sdk/oaiq.min.js")
+    assert _csp_path_matches("/sdk%2F", "/sdk%2f")
+    assert not _csp_path_matches("/SDK/", "/sdk/oaiq.min.js")
+    assert _csp_path_matches("/%73dk/", "/sdk/oaiq.min.js")
+    summary, _, _ = csp_pixel_findings({"Content-Security-Policy": "default-src 'SELF'"},
+                                     page_url="https://bzrcdn.openai.com:443/")
+    assert summary[0]["allowed"] == {"script": True, "connect_config": True, "connect_events": False, "img": False}
+    summary, _, _ = csp_pixel_findings({"Content-Security-Policy": "script-src 'self'"},
+                                     page_url="https://bzrcdn.openai.com:0/")
+    assert summary[0]["allowed"]["script"] is False
+
+
+@pytest.mark.parametrize("html", [
+    '<html><head></head><body><meta http-equiv="Content-Security-Policy" content="default-src none"></body></html>',
+    '<head><template><meta http-equiv="Content-Security-Policy" content="default-src none"></template></head>',
+    '<head><template><template></template><meta http-equiv="Content-Security-Policy" content="default-src none"></template></head>',
+])
+def test_csp_ignores_inert_meta(html):
+    from oaiads.commands.account import csp_pixel_findings
+    assert csp_pixel_findings(html=html) == ([], [], None)
+
+
+@pytest.mark.parametrize("pixel_markup", ["", "<script>oaiq('init')</script>", '<script src="https://bzrcdn.openai.com/sdk/oaiq.min.js"></script>'])
+def test_landing_check_csp_pixel_visibility(monkeypatch, dummy_resp, capsys, pixel_markup):
+    from oaiads.commands import account
+
+    def fake_get(url, **kwargs):
+        response = dummy_resp(headers={"Content-Type": "text/html", "Content-Security-Policy": "default-src 'none'"},
+                              text='<head><link rel="icon" href="/icon.ico"></head>' + pixel_markup)
+        response.url = url
+        return response
+
+    monkeypatch.setattr(account.requests, "get", fake_get)
+    run(["landing-check", "--url", "https://example.com/", "--json"])
+    result = json.loads(capsys.readouterr().out)
+    assert result["checks"]["pixel_in_source"] is bool(pixel_markup)
+    assert any(f["level"] == "warn" for f in result["findings"]) is bool(pixel_markup)
+    run(["landing-check", "--url", "https://example.com/"])
+    err = capsys.readouterr().err.splitlines()
+    if not pixel_markup:
+        assert err[0] == ("ℹ Pixel not found in the page source (it may be loaded via a tag manager): "
+                          "CSP findings below matter only if you use the Measurement Pixel.")
+        assert all(line.startswith("ℹ") for line in err)
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+@pytest.mark.parametrize("failure", ["malformed", "timeout", "connection"])
+def test_landing_check_incomplete_checks_continue(monkeypatch, dummy_resp, capsys, json_output, failure):
+    from oaiads.commands import account
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        if "oppref=" in url and failure != "malformed":
+            error = account.requests.Timeout if failure == "timeout" else account.requests.ConnectionError
+            raise error("probe unavailable")
+        response = dummy_resp(headers={"Content-Type": "text/html", **({"Content-Security-Policy": "script-src 'none'"} if failure == "malformed" else {})},
+                              text='<head><link rel="icon" href="/icon.ico"></head>' + ('<![foo]>' if failure == "malformed" else ''))
+        response.url = url
+        return response
+
+    monkeypatch.setattr(account.requests, "get", fake_get)
+    run(["landing-check", "--url", "https://example.com/"] + (["--json"] if json_output else []))
+    captured = capsys.readouterr()
+    assert calls[-1].endswith("/robots.txt")
+    if json_output:
+        result = json.loads(captured.out)
+        checks = result["checks"]
+        assert checks["bot_status"] == 200
+        assert checks["robots_status"] == 200
+        if failure == "malformed":
+            assert "NotImplementedError" in checks["csp_meta_error"]
+            assert checks["csp"][0]["allowed"]["script"] is False
+            assert checks["oppref_survives"] is True
+            assert any("meta parsing incomplete" in f["message"] for f in result["findings"])
+        else:
+            assert checks["oppref_survives"] is None
+            assert checks["oppref_status"] is None
+            assert any(f["level"] == "warn" and "attribution check inconclusive" in f["message"] for f in result["findings"])
+    else:
+        assert "✅" not in captured.out
+        assert ("meta parsing incomplete" if failure == "malformed" else "oppref probe request failed (probe unavailable)") in captured.err
+
+
+def test_csp_malformed_html_keeps_headers_and_parsed_head_meta():
+    from oaiads.commands.account import csp_pixel_findings
+    summary, findings, error = csp_pixel_findings({"Content-Security-Policy": "connect-src 'none'"},
+        '<head><meta http-equiv="Content-Security-Policy" content="img-src &apos;none&apos;"><![foo]>')
+    assert [s["source"] for s in summary] == ["header", "meta"]
+    assert error is not None
+    assert any("meta parsing incomplete" in msg for _, msg in findings)
+
+
+@pytest.mark.parametrize("html, expected", [
+    ('<head><link rel="icon" href="/i"><meta http-equiv="Content-Security-Policy" '
+     'content="script-src https://bzrcdn.openai.com; connect-src &apos;none&apos;"></head>', False),
+    ('<!-- <script src="https://bzrcdn.openai.com/sdk/oaiq.min.js"></script> oaiq() -->', False),
+    ('<p>Load https://bzrcdn.openai.com/sdk/oaiq.min.js and call oaiq()</p>', False),
+    ('<meta name="docs" content="oaiq()">', False),
+    ('<script src="https://bzrcdn.openai.com/sdk/oaiq.min.js"></script>', True),
+    ('<SCRIPT SRC="//BZRCDN.OPENAI.COM/sdk/oaiq.min.js"></SCRIPT>', True),
+    ('<script>oaiq("init")</script>', True),
+    ('<script>const sdk = "https://bzrcdn.openai.com/sdk/oaiq.min.js";</script>', True),
+    ('<script src="https://bzrcdn.openai.com.evil.test/sdk/oaiq.min.js"></script>', False),
+    ('<script src="https://[bad"></script>', False),
+    ('<![foo]>', False),
+    ('<script>oaiq()</script><![foo]>', False),
+])
+def test_pixel_script_evidence(html, expected):
+    from oaiads.commands.account import _pixel_in_source
+    assert _pixel_in_source(html) is expected
+
+
+def test_landing_check_csp_meta_is_not_pixel(monkeypatch, dummy_resp, capsys):
+    from oaiads.commands import account
+
+    def fake_get(url, **kwargs):
+        response = dummy_resp(headers={"Content-Type": "text/html"}, text=(
+            '<head><link rel="icon" href="/i"><meta http-equiv="Content-Security-Policy" '
+            'content="script-src https://bzrcdn.openai.com; connect-src &apos;none&apos;"></head>'))
+        response.url = url
+        return response
+
+    monkeypatch.setattr(account.requests, "get", fake_get)
+    run(["landing-check", "--url", "https://example.com/", "--json"])
+    result = json.loads(capsys.readouterr().out)
+    assert result["checks"]["pixel_in_source"] is False
+    assert result["findings"][0]["message"].startswith("Pixel not found")
+    assert len(result["findings"]) == 3
+    assert all(f["level"] == "info" for f in result["findings"])
+
+
+@pytest.mark.parametrize("clean_type, probe_type, warns", [
+    ("text/html", "TEXT/HTML; charset=UTF-8", False),
+    (" TEXT/HTML ; charset=UTF-8", "text/html", False),
+    ("text/html", "application/xhtml+xml; charset=UTF-8", False),
+    ("APPLICATION/XHTML+XML", "text/html", False),
+    ("application/xhtml+xml", "application/json", True),
+    ("text/html", "application/text/html", True),
+    ("application/text/html", "application/json", False),
+])
+def test_landing_check_probe_media_types(monkeypatch, dummy_resp, capsys, clean_type, probe_type, warns):
+    from oaiads.commands import account
+
+    def fake_get(url, **kwargs):
+        response = dummy_resp(headers={"Content-Type": probe_type if "oppref=" in url else clean_type},
+                              text='<head><link rel="icon" href="/i"></head>')
+        response.url = url
+        return response
+
+    monkeypatch.setattr(account.requests, "get", fake_get)
+    run(["landing-check", "--url", "https://example.com/", "--json"])
+    result = json.loads(capsys.readouterr().out)
+    assert any("oppref probe returns non-HTML" in f["message"] for f in result["findings"]) is warns
+    if not warns and "application/text/html" not in clean_type:
+        # the clean-page content-type warning is pre-existing behaviour and out of scope here
+        assert [f for f in result["findings"] if not f["message"].startswith("content-type is")] == []
+
+
+@pytest.mark.parametrize("source", [
+    "script-src\u00a0https:",
+    "script-src https://bzrcdn.openai.com:",
+    "script-src https://bzrcdn.openai.com:\t",
+    "script-src https://bzrcdn.openai.com:+443",
+    "script-src https://bzrcdn.openai.com:٤٤٣",
+    "script-src https://bzrcdn.openai.com\u00a0",
+    "script-src 'nonce-Ab\u00a0Cd'",
+    "script-src https:\u2003https://bzrcdn.openai.com",
+])
+def test_csp_rejects_malformed_grants(source):
+    from oaiads.commands.account import csp_pixel_findings
+    summary, findings, error = csp_pixel_findings(
+        {"Content-Security-Policy": "default-src 'none'; " + source}, '<script>oaiq()</script>')
+    assert error is None
+    assert summary[0]["allowed"]["script"] is False
+    assert any(level == "warn" and "SDK source is not allowed" in msg for level, msg in findings)
+
+
+@pytest.mark.parametrize("whitespace", [" ", "\t", "\n", "\f", "\r"])
+def test_csp_ascii_whitespace(whitespace):
+    from oaiads.commands.account import csp_pixel_findings
+    summary, _, _ = csp_pixel_findings({"Content-Security-Policy": "script-src" + whitespace + "https:"})
+    assert summary[0]["allowed"]["script"] is True
+
+
+@pytest.mark.parametrize("scheme, expected", [("http:", True), ("HTTP:", True), ("ws:", False), ("wss:", False)])
+def test_csp_scheme_sources_for_https_pixel(scheme, expected):
+    from oaiads.commands.account import csp_pixel_findings
+    summary, _, _ = csp_pixel_findings({"Content-Security-Policy": "default-src " + scheme})
+    assert all(value is expected for value in summary[0]["allowed"].values())
+
+
+@pytest.mark.parametrize("page, expected", [
+    ("http://bzrcdn.openai.com/", True),
+    ("http://bzrcdn.openai.com:80/", True),
+    ("http://bzrcdn.openai.com:443/", True),
+    ("http://bzrcdn.openai.com:8080/", False),
+    ("http://example.com/", False),
+])
+def test_csp_self_http_upgrade(page, expected):
+    from oaiads.commands.account import csp_pixel_findings
+    summary, _, _ = csp_pixel_findings({"Content-Security-Policy": "script-src 'self'"}, page_url=page)
+    assert summary[0]["allowed"]["script"] is expected
+
+
 # ---------------------------------------------------------------------------
 # 1.2.0 — findings from the first live write session
 # ---------------------------------------------------------------------------

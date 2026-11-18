@@ -244,7 +244,7 @@ def collapse_warnings(warns: list[str], min_count: int = COLLAPSE_MIN) -> tuple[
 
 
 def report(findings: list, strict: bool = True, collapse: bool = True) -> bool:
-    """Print findings to stderr (errors first, then warnings). Returns True when there are errors.
+    """Print findings to stderr (errors first, then warnings and info). Returns True when there are errors.
 
     collapse: fold ≥ COLLAPSE_MIN warnings of one kind into a single counted line (plan-apply
     --verbose-lint turns it off).
@@ -261,4 +261,7 @@ def report(findings: list, strict: bool = True, collapse: bool = True) -> bool:
         _err(f"⚠ {m}")
     if folded:
         _err(f"  ({folded} warning kind(s) folded into counted lines — plan-apply --verbose-lint lists each)")
+    for lvl, m in findings:
+        if lvl == "info":
+            _err(f"ℹ {m}")
     return bool(errors) if strict else False

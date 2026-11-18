@@ -157,7 +157,7 @@ OPENAI_ADS_API_KEY=<key>                       # one account
 
 A ChatGPT Ads campaign depends on the technical integration of your website and measurement. Before you launch anything, these must be in place: approved brand review + payment method, an **account spending limit** (where available, otherwise a daily budget + campaign end), a landing page reachable for **OAI-AdsBot** (robots.txt and WAF/CDN), **oppref surviving redirects**, measurement in place (pixel and/or Conversions API with a shared event id, consent hook, CSP) **linked to the campaign** (on CPC too, otherwise you compare CPC instead of cost per customer), and for e-shops a feed with `is_ads_eligible` and automatic sync (items expire after 14 days).
 
-Watch out when creating the account: a personal account has no permission to create ad accounts in the tenant. A company e-mail + invitation works (see playbook §7). Everything except measurement is checked by `./run.sh landing-check --url …` and `./run.sh account`. The full checklist, rules for context hints (describe situations, not keywords), recommended text lengths (~16 / ~32 characters), bidding and billing traps: [skill/chatgpt-ads/chatgpt-ads-campaign-playbook.md](skill/chatgpt-ads/chatgpt-ads-campaign-playbook.md).
+Watch out when creating the account: a personal account has no permission to create ad accounts in the tenant. A company e-mail + invitation works (see playbook §7). Use `./run.sh landing-check --url …` for landing reachability, oppref probe health and static Pixel CSP checks (not event delivery); use `./run.sh account` for account prerequisites. The full checklist, rules for context hints (describe situations, not keywords), recommended text lengths (~16 / ~32 characters), bidding and billing traps: [skill/chatgpt-ads/chatgpt-ads-campaign-playbook.md](skill/chatgpt-ads/chatgpt-ads-campaign-playbook.md).
 
 ## Multiple accounts (agencies)
 
@@ -224,7 +224,7 @@ The API limits **600 req/min per endpoint and 1 200 req/min overall, per ad acco
 | `account-pause` / `account-activate` [write] | Pause / activate the whole account | |
 | `api-limits` | Local budget vs. documented limits | |
 | `api-key-create` [write] | Another API key for the account (shown once) | `--name` |
-| `landing-check` | Local landing page check: HTTP status for browser and bot UA (WAF/CDN), HTML, favicon, robots.txt (OAI-AdsBot, OAI-SearchBot, `*`), captcha, **oppref survives redirects** | `--url` |
+| `landing-check` | Local landing page check: HTTP status for browser and bot UA (WAF/CDN), HTML, favicon, robots.txt (OAI-AdsBot, OAI-SearchBot, `*`), captcha, **oppref survives redirects** (including URL fragments), oppref probe health, static Measurement Pixel CSP check | `--url` |
 
 ### Campaigns
 

@@ -1,5 +1,7 @@
 """Lint: hard limits from the spec + policy heuristics."""
 
+import pytest
+
 from oaiads import lint
 from oaiads.formatting import amount_to_micros, micros_to_amount, fmt_money
 
@@ -95,3 +97,14 @@ def test_report_folds_repeated_warnings_of_one_kind(capsys):
     lint.report(findings, collapse=False)
     err = capsys.readouterr().err
     assert err.count("creative.title is ") == 4 and "×" not in err
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_report_prints_info_after_warnings_to_stderr(capsys, strict):
+    findings = [("info", "Pixel guidance"), ("warn", "warning"), ("error", "error")]
+    assert lint.report(findings, strict=strict) is strict
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.splitlines() == ["✗ error", "⚠ warning", "ℹ Pixel guidance"]
+    assert lint.report([("info", "guidance only")], strict=strict) is False
+    assert capsys.readouterr().err == "ℹ guidance only\n"
