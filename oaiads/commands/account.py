@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import re
 from datetime import date
-from urllib.parse import urlparse
+from html.parser import HTMLParser
+from urllib.parse import unquote, urlencode, urlparse, urlsplit, urlunsplit
 
 import requests
 
@@ -405,6 +406,7 @@ _BROWSER_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.3
 # Best-effort imitation of the reviewer's crawler UA string (the exact string is not published).
 _BOT_UA = "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; OAI-AdsBot/1.0; +https://openai.com/bots"
 OPPREF_PROBE = "oaiads-test123"
+_CHALLENGE_RE = re.compile(r"captcha|cf-challenge|just a moment")
 
 
 def oppref_survives(final_url: str, probe: str = OPPREF_PROBE) -> bool:
@@ -413,8 +415,229 @@ def oppref_survives(final_url: str, probe: str = OPPREF_PROBE) -> bool:
     return any(p.split("=", 1) == ["oppref", probe] for p in q.split("&") if p)
 
 
+def oppref_probe_url(url: str, probe: str = OPPREF_PROBE) -> str:
+    """Append the attribution probe to the query, before any fragment."""
+    parts = urlsplit(url)
+    query = parts.query + ("&" if parts.query else "") + urlencode({"oppref": probe})
+    return urlunsplit(parts._replace(query=query))
+
+
+# Best-effort HTML discovery: duplicate attributes and <noscript> meta may
+# differ from browsers; implicit head recovery and resource ordering are not modeled.
+class _CSPMetaParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.policies = []
+        self.in_head = False
+        self.template_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "template":
+            self.template_depth += 1
+        if self.template_depth:
+            return
+        if tag == "head":
+            self.in_head = True
+        elif tag == "body":
+            self.in_head = False
+        if tag != "meta" or not self.in_head:
+            return
+        attrs = dict(attrs)
+        if (attrs.get("http-equiv") or "").strip().lower() == "content-security-policy":
+            self.policies.append(("meta", attrs.get("content") or ""))
+
+    def handle_endtag(self, tag):
+        if tag == "template":
+            self.template_depth = max(0, self.template_depth - 1)
+        elif tag == "head" and not self.template_depth:
+            self.in_head = False
+
+
+def _csp_path_matches(source_path: str, target_path: str) -> bool:
+    # CSP splits before decoding: %2F is part of a segment, not a separator.
+    source = [unquote(p) for p in source_path.split("/")]
+    target = [unquote(p) for p in target_path.split("/")]
+    return target[:len(source) - 1] == source[:-1] if source_path.endswith("/") else source == target
+
+
+def _csp_source_allows(source: str, target: str, page_url: str, known_path: bool = True) -> bool | str:
+    """Match HTTPS Pixel URLs; return 'conditional' for uncertain path grants.
+
+    Static advisory, not a browser CSP implementation: no nonce/hash validation,
+    redirects or JS execution. Meta policies are not applied in resource order;
+    directives such as sandbox and implicit HTML head recovery are not modeled.
+    """
+    if any(char.isspace() and char not in "\t\n\f\r " for char in source):
+        return False
+    url = urlsplit(target)
+    keyword = source.lower()  # never normalize path or nonce/hash payloads
+    if keyword in ("*", "https:", "http:"):
+        return True  # http: upgrades to https; ws:/wss: do not cover https in Chromium (checked in a browser)
+    if keyword == "'self'":
+        try:
+            page = urlsplit(page_url)
+            page_port = page.port if page.port is not None else (443 if page.scheme == "https" else 80)
+            target_port = url.port if url.port is not None else 443
+            same_origin = (page.scheme, page.hostname, page_port) == (url.scheme, url.hostname, target_port)
+            upgraded = (page.scheme == "http" and url.scheme == "https" and page.hostname == url.hostname
+                        and (page_port == target_port or (page_port == 80 and target_port == 443)))
+            return same_origin or upgraded
+        except ValueError:
+            return False
+    if source.startswith("'"):
+        return False
+    authority = source.split("://", 1)[-1].split("/", 1)[0]
+    if ":" in authority and not re.fullmatch(r"[0-9]+|\*", authority.rsplit(":", 1)[1]):
+        return False  # urlsplit accepts an empty port; CSP does not
+    try:
+        host_source = urlsplit(source if "://" in source else "https://" + source)
+        if host_source.username is not None or host_source.query or host_source.fragment:
+            return False
+        if host_source.scheme not in ("http", "https") or not host_source.hostname:
+            return False
+        host = host_source.hostname.lower()
+        if not (url.hostname == host or host == "*" or
+                (host.startswith("*.") and url.hostname.endswith(host[1:]))):
+            return False
+        wildcard_port = host_source.netloc.endswith(":*")
+        port = None if wildcard_port else host_source.port
+        if not wildcard_port and port not in (None, 443) and not (host_source.scheme == "http" and port == 80):
+            return False
+    except ValueError:
+        return False  # malformed source expressions cannot grant access
+    path = host_source.path
+    if not path or path == "/":
+        return True
+    if known_path and _csp_path_matches(path, url.path):
+        return True
+    return "conditional"  # matching host, but actual path coverage needs browser verification
+
+
+class _PixelScriptParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.found = False
+        self.inline_script = False
+        self.script_text = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag != "script":
+            return
+        attrs = dict(attrs)
+        src = attrs.get("src") or ""
+        if src:
+            url = urlsplit(src)
+            if url.scheme in ("", "http", "https") and url.hostname == "bzrcdn.openai.com":
+                self.found = True
+        self.inline_script = "src" not in attrs
+        self.script_text = []
+
+    def handle_data(self, data):
+        if self.inline_script:
+            self.script_text.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "script":
+            text = "".join(self.script_text)
+            if re.search(r"\boaiq\s*\(|https://bzrcdn\.openai\.com/sdk/oaiq\.min\.js", text):
+                self.found = True
+            self.inline_script = False
+            self.script_text = []
+
+
+def _pixel_in_source(html: str) -> bool:
+    parser = _PixelScriptParser()
+    try:
+        parser.feed(html)
+        parser.close()
+    except Exception:
+        return False  # remote markup/URLs must never break the landing check
+    return parser.found
+
+
+def _is_html(content_type: str) -> bool:
+    return content_type.split(";", 1)[0].strip().lower() in ("text/html", "application/xhtml+xml")
+
+
+def csp_pixel_findings(headers=None, html: str = "", page_url: str = "") -> tuple[list, list, str | None]:
+    """Return (per-policy summary, findings, meta parse error), entirely offline."""
+    policies = []
+    for key, value in (headers or {}).items():
+        source = {"content-security-policy": "header",
+                  "content-security-policy-report-only": "report-only"}.get(key.lower())
+        if source:
+            policies.extend((source, policy.strip("\t\n\f\r ")) for policy in value.split(",") if policy.strip("\t\n\f\r "))
+    parser = _CSPMetaParser()
+    meta_error = None
+    try:
+        parser.feed(html)
+        parser.close()
+    except Exception as e:
+        # Remote markup must never abort landing-check, even on HTMLParser's
+        # AssertionError/NotImplementedError paths. Keep headers and parsed metas.
+        meta_error = f"{type(e).__name__}: {str(e)[:160]}"
+    policies.extend(parser.policies)
+    capabilities = {
+        "script": (("script-src-elem", "script-src", "default-src"), "https://bzrcdn.openai.com/sdk/oaiq.min.js",
+                   "the SDK source is not allowed"),
+        "connect_events": (("connect-src", "default-src"), "https://bzr.openai.com/v1/sdk/events", "Pixel event delivery via fetch/sendBeacon is restricted"),
+        "connect_config": (("connect-src", "default-src"), "https://bzrcdn.openai.com/", "Pixel configuration requests are restricted"),
+        "img": (("img-src", "default-src"), "https://bzr.openai.com/v1/sdk/events", "the Pixel image request fallback is restricted"),
+    }
+    summary, findings = [], []
+    blocked, conditional = {}, {}
+    for source, policy in policies:
+        directives = {}
+        for directive in policy.split(";"):
+            tokens = re.findall(r"[^\t\n\f\r ]+", directive)
+            if tokens:
+                directives.setdefault(tokens[0].lower(), tokens[1:])  # first occurrence wins
+        allowed = {}
+        kind = "report-only" if source == "report-only" else "enforced"
+        for capability, (fallback, target, _) in capabilities.items():
+            name = next((name for name in fallback if name in directives), None)
+            expressions = [expr for expr in directives.get(name, [])
+                           if not any(char.isspace() and char not in "\t\n\f\r " for char in expr)]
+            grants = [_csp_source_allows(expr, target, page_url, known_path=capability != "connect_config")
+                      for expr in expressions]
+            reason = None
+            if capability == "script" and any(expr.lower() == "'strict-dynamic'" for expr in expressions):
+                reason = "uses 'strict-dynamic': host allowlists are ignored; the SDK must be loaded by a nonced/hashed script"
+            elif name is None or any(grant is True for grant in grants):
+                allowed[capability] = True
+            elif capability == "script" and any(re.match(r"^'(?:nonce|sha256|sha384|sha512)-[^']+'$", expr, re.I) for expr in expressions):
+                reason = ("relies on nonces/hashes; make sure the Pixel loader and SDK script carry the nonce "
+                          "(or allow https://bzrcdn.openai.com); hash authorization must also be verified in the browser")
+            elif "conditional" in grants:
+                reason = "has a path-restricted source, verify the actual request URL in the browser console"
+            else:
+                allowed[capability] = False
+                blocked.setdefault((kind, capability), set()).add(name)
+            if reason:
+                allowed[capability] = "conditional"
+                conditional.setdefault((kind, capability, reason), set()).add(name)
+        summary.append({"source": source, "allowed": allowed})
+    pixel_visible = _pixel_in_source(html)
+    if (blocked or conditional or meta_error) and not pixel_visible:
+        findings.append(("info", "Pixel not found in the page source (it may be loaded via a tag manager): "
+                         "CSP findings below matter only if you use the Measurement Pixel."))
+    for (kind, capability), names in blocked.items():
+        _, target, consequence = capabilities[capability]
+        origin = "https://" + urlsplit(target).netloc
+        prefix = "CSP report-only (not enforced) would block" if kind == "report-only" else "CSP blocks"
+        advice = " Use a nonce/hash or allow this source; do not add 'unsafe-inline'." if capability == "script" else " Allow this source if needed."
+        findings.append(("warn" if pixel_visible and kind == "enforced" else "info",
+                         f"{prefix} the OpenAI Measurement Pixel: {', '.join(sorted(names))} does not allow {origin} — {consequence}.{advice}"))
+    for (kind, capability, reason), names in conditional.items():
+        findings.append(("info", f"CSP ({kind}{', not enforced' if kind == 'report-only' else ''}), {capability}: "
+                         f"{', '.join(sorted(names))} {reason}; static check is conditional."))
+    if meta_error:
+        findings.append(("info", f"CSP meta parsing incomplete ({meta_error}); header policies and other landing checks still evaluated."))
+    return summary, findings, meta_error
+
+
 def cmd_landing_check(args) -> None:
-    """Local reachability + WAF + robots + favicon + oppref check for a landing page."""
+    """Local reachability + WAF + robots + favicon + oppref + CSP check for a landing page."""
     url = args.url
     findings: list = []
     lint.lint_url(url, findings)
@@ -436,6 +659,11 @@ def cmd_landing_check(args) -> None:
             findings.append(("error", f"landing page returned HTTP {r.status_code} (review reason crawler_{r.status_code})."))
         if "text/html" not in checks["content_type"]:
             findings.append(("warn", f"content-type is {checks['content_type'] or 'unknown'} — reviewers expect an HTML page (unsupported_content_type)."))
+        checks["pixel_in_source"] = _pixel_in_source(r.text)
+        checks["csp"], csp_findings, meta_error = csp_pixel_findings(r.headers, r.text, r.url)
+        if meta_error:
+            checks["csp_meta_error"] = meta_error
+        findings.extend(csp_findings)
         html = r.text[:400_000].lower()
         has_favicon = bool(re.search(r'<link[^>]+rel=["\'](?:shortcut )?icon', html))
         checks["favicon_link"] = has_favicon
@@ -445,7 +673,7 @@ def cmd_landing_check(args) -> None:
             checks["favicon_ico"] = fav.status_code
         if not has_favicon:
             findings.append(("warn", "no favicon found — `missing_favicon` is a documented review reason (account favicon: image-upload --purpose account_favicon + brand-update)."))
-        if re.search(r"captcha|cf-challenge|just a moment", html):
+        if _CHALLENGE_RE.search(html):
             findings.append(("warn", "page looks like a bot challenge/captcha (crawler_captcha)."))
         if re.search(r'<meta[^>]+name=["\']robots["\'][^>]+noindex', html):
             findings.append(("warn", "meta robots noindex present — the reviewer's crawler may skip the page."))
@@ -467,16 +695,27 @@ def cmd_landing_check(args) -> None:
 
     # 3) oppref — OpenAI appends ?oppref=<click ref>; redirects/routing must keep it for attribution
     try:
-        sep = "&" if parsed.query else "?"
-        ro = get(f"{url}{sep}oppref={OPPREF_PROBE}", _BROWSER_UA)
+        ro = get(oppref_probe_url(url), _BROWSER_UA)
+        checks["oppref_status"] = ro.status_code
         checks["oppref_final_url"] = ro.url
         checks["oppref_survives"] = oppref_survives(ro.url)
+        if ro.status_code >= 400 and 0 < checks.get("status", 0) < 400:
+            findings.append(("error", f"the test request with ?oppref= returned HTTP {ro.status_code} while the clean URL returned {checks['status']} — "
+                                      "ad clicks always carry ?oppref=…, so check WAF rules / query-parameter handling."))
+        if _CHALLENGE_RE.search(ro.text[:400_000].lower()) and not _CHALLENGE_RE.search(html):
+            findings.append(("warn", "the response to the ?oppref= test request contains captcha/challenge text that the clean page does not — "
+                                     f"open {oppref_probe_url(url)} in a browser and check."))
+        if _is_html(checks.get("content_type", "")) and not _is_html(ro.headers.get("Content-Type", "")):
+            findings.append(("warn", "the oppref probe returns non-HTML while the clean page is HTML — "
+                                     "ad clicks may not reach the landing page; check WAF rules / query-param handling."))
         if not checks["oppref_survives"]:
             findings.append(("error", "the oppref query parameter is stripped by a redirect/router — the Pixel cannot store the click "
                                       "reference (__oppref cookie) and click attribution is silently lost. Preserve query params on "
                                       "www/https/locale/consent redirects."))
-    except requests.RequestException:
+    except requests.RequestException as e:
+        checks["oppref_status"] = None
         checks["oppref_survives"] = None
+        findings.append(("warn", f"oppref probe request failed ({str(e)[:160]}) — attribution check inconclusive."))
 
     # 4) robots.txt
     try:
@@ -499,7 +738,7 @@ def cmd_landing_check(args) -> None:
         print(f"Landing check: {url}")
         for k, v in checks.items():
             print(f"  {k}: {v}")
-        if not findings:
+        if not findings and checks.get("oppref_survives") is True:
             print("✅ No issues found (reachable for browser and bot UA, HTML, favicon present, oppref survives, robots ok).")
         else:
             lint.report(findings, strict=False)

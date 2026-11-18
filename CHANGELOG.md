@@ -2,6 +2,15 @@
 
 Všechny podstatné změny v tomto projektu. Formát vychází z [Keep a Changelog](https://keepachangelog.com/), verzování je [SemVer](https://semver.org/) (verze žije v `oaiads/__init__.py`).
 
+## [Unreleased]
+
+### Přidáno
+- `landing-check` staticky kontroluje CSP pro Measurement Pixel (hlavičky i `<meta>` v `<head>`, report-only zvlášť): načtení SDK z `bzrcdn.openai.com` (`script-src`), odesílání událostí a konfiguraci (`connect-src`) a obrázkový fallback (`img-src`). Nejisté granty s nonce/hash či omezenou cestou a `strict-dynamic` hlásí jako podmíněné. Když pixel ve skriptech stránky není (třeba kvůli GTM), jsou nálezy jen informativní (ℹ, nově vypisované i v textovém výstupu).
+- `oppref_status`: chyba, když stránka s `?oppref=…` vrátí HTTP chybu a čistá URL ne; varování, když jen testovací požadavek narazí na captcha/challenge nebo ne-HTML odpověď, a když požadavek selže (kontrola atribuce pak není průkazná).
+
+### Opraveno
+- Testovací `oppref` se přidává do query před fragment, takže URL s `#kotvou` už nehlásí falešnou ztrátu atribuce.
+
 ## [1.5.0] — 2026-09-24 — Srovnání s API po 2026-09-02 🆕
 
 Nové porovnání appky s API: changelog OpenAI (9. a 10. září), celé docs znovu přečtené (`llms-full.txt`), aktuální OpenAPI spec strojově porovnaná s tím, co CLI posílá (verze spec je pořád 2.3.0, obsah ale jiný: 78 operací místo 88), čtení ověřené živě na dvou self-serve účtech. Detail v `docs/api-notes.md → Změny API 2026-09`.

@@ -157,7 +157,7 @@ OPENAI_ADS_API_KEY=<klíč>                       # jeden účet
 
 Kampaň v ChatGPT Ads stojí na technickém napojení webu a měření. Než něco pustíš, musí sedět: schválený brand review + platební metoda, **limit útraty účtu** (kde je dostupný, jinak denní budget + konec kampaně), landing page dostupná pro **OAI-AdsBot** (robots.txt i WAF/CDN), **oppref přežije redirecty**, nasazené měření (pixel a/nebo Conversions API se sdíleným event id, consent hook, CSP) **napojené na kampaň** (i na CPC, jinak porovnáváš CPC místo ceny za zákazníka), u e-shopů feed s `is_ads_eligible` a automatickou synchronizací (položky expirují po 14 dnech).
 
-Pozor na založení účtu: osobní účet nemá právo zakládat ad accounty v tenantu. Funguje firemní e-mail + pozvánka (viz playbook §7). Všechno kromě měření ověří `./run.sh landing-check --url …` a `./run.sh account`. Kompletní checklist, pravidla pro context hints (popisuj situace, ne klíčová slova), doporučené délky textů (~16 / ~32 znaků), bidding a fakturační pasti: [skill/chatgpt-ads/chatgpt-ads-campaign-playbook.md](skill/chatgpt-ads/chatgpt-ads-campaign-playbook.md).
+Pozor na založení účtu: osobní účet nemá právo zakládat ad accounty v tenantu. Funguje firemní e-mail + pozvánka (viz playbook §7). `./run.sh landing-check --url …` kontroluje dostupnost landing page, odpověď na test s oppref a staticky CSP pro pixel (nikoli doručení událostí); `./run.sh account` ověří předpoklady na úrovni účtu. Kompletní checklist, pravidla pro context hints (popisuj situace, ne klíčová slova), doporučené délky textů (~16 / ~32 znaků), bidding a fakturační pasti: [skill/chatgpt-ads/chatgpt-ads-campaign-playbook.md](skill/chatgpt-ads/chatgpt-ads-campaign-playbook.md).
 
 ## Více účtů (agentury)
 
@@ -224,7 +224,7 @@ API limituje **600 req/min na endpoint a 1 200 req/min celkem, per ad account i
 | `account-pause` / `account-activate` [write] | Pauza / aktivace celého účtu | |
 | `api-limits` | Lokální budget vs. dokumentované limity | |
 | `api-key-create` [write] | Další API klíč pro účet (zobrazí se jednou) | `--name` |
-| `landing-check` | Lokální kontrola landing page: HTTP status pro browser i bot UA (WAF/CDN), HTML, favicon, robots.txt (OAI-AdsBot, OAI-SearchBot, `*`), captcha, **oppref přežije redirecty** | `--url` |
+| `landing-check` | Lokální kontrola landing page: HTTP status pro browser i bot UA (WAF/CDN), HTML, favicon, robots.txt (OAI-AdsBot, OAI-SearchBot, `*`), captcha, **oppref přežije redirecty** (i u URL s fragmentem), stav odpovědi na test s oppref, statická kontrola CSP pro Measurement Pixel | `--url` |
 
 ### Kampaně
 
